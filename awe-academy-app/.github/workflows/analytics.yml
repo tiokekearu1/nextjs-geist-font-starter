@@ -1,0 +1,417 @@
+name: Analytics Management
+
+on:
+  schedule:
+    - cron: '0 0 * * *'  # Run daily at midnight UTC
+  workflow_dispatch:
+    inputs:
+      analysis_type:
+        description: 'Type of analysis to perform'
+        required: true
+        type: choice
+        options:
+          - all
+          - usage
+          - performance
+          - user
+          - business
+      time_range:
+        description: 'Time range for analysis'
+        required: true
+        default: '7d'
+        type: choice
+        options:
+          - 1d
+          - 7d
+          - 30d
+          - 90d
+      data_source:
+        description: 'Data source to analyze'
+        required: true
+        type: choice
+        options:
+          - all
+          - logs
+          - database
+          - events
+          - metrics
+
+jobs:
+  prepare:
+    name: Prepare Analytics
+    runs-on: ubuntu-latest
+    
+    outputs:
+      analysis_id: ${{ steps.generate.outputs.id }}
+      start_date: ${{ steps.timerange.outputs.start }}
+      end_date: ${{ steps.timerange.outputs.end }}
+    
+    steps:
+      - name: Generate analysis ID
+        id: generate
+        run: echo "id=$(date +%Y%m%d_%H%M%S)_$RANDOM" >> $GITHUB_OUTPUT
+
+      - name: Calculate time range
+        id: timerange
+        run: |
+          end_date=$(date -u +"%Y-%m-%d")
+          
+          case "${{ github.event.inputs.time_range || '7d' }}" in
+            "1d")
+              start_date=$(date -u -d "1 day ago" +"%Y-%m-%d")
+              ;;
+            "7d")
+              start_date=$(date -u -d "7 days ago" +"%Y-%m-%d")
+              ;;
+            "30d")
+              start_date=$(date -u -d "30 days ago" +"%Y-%m-%d")
+              ;;
+            "90d")
+              start_date=$(date -u -d "90 days ago" +"%Y-%m-%d")
+              ;;
+          esac
+          
+          echo "start=$start_date" >> $GITHUB_OUTPUT
+          echo "end=$end_date" >> $GITHUB_OUTPUT
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+  usage:
+    name: Usage Analytics
+    needs: prepare
+    runs-on: ubuntu-latest
+    if: github.event.inputs.analysis_type == 'all' || github.event.inputs.analysis_type == 'usage'
+    
+    steps:
+      - name: Analyze page views
+        run: |
+          aws cloudwatch get-metric-data \
+            --metric-data-queries '[{
+              "Id": "pageviews",
+              "MetricStat": {
+                "Metric": {
+                  "Namespace": "AWEAcademy",
+                  "MetricName": "PageViews"
+                },
+                "Period": 86400,
+                "Stat": "Sum"
+              },
+              "ReturnData": true
+            }]' \
+            --start-time "${{ needs.prepare.outputs.start_date }}T00:00:00Z" \
+            --end-time "${{ needs.prepare.outputs.end_date }}T23:59:59Z" \
+            > pageviews.json
+
+      - name: Analyze user sessions
+        run: |
+          aws cloudwatch get-metric-data \
+            --metric-data-queries '[{
+              "Id": "sessions",
+              "MetricStat": {
+                "Metric": {
+                  "Namespace": "AWEAcademy",
+                  "MetricName": "UserSessions"
+                },
+                "Period": 86400,
+                "Stat": "Sum"
+              },
+              "ReturnData": true
+            }]' \
+            --start-time "${{ needs.prepare.outputs.start_date }}T00:00:00Z" \
+            --end-time "${{ needs.prepare.outputs.end_date }}T23:59:59Z" \
+            > sessions.json
+
+      - name: Generate usage report
+        run: |
+          echo "# Usage Analytics Report" > usage-report.md
+          echo "## Analysis ID: ${{ needs.prepare.outputs.analysis_id }}" >> usage-report.md
+          echo "## Time Range: ${{ needs.prepare.outputs.start_date }} to ${{ needs.prepare.outputs.end_date }}" >> usage-report.md
+          
+          echo "## Page Views" >> usage-report.md
+          jq -r '.MetricDataResults[0].Values | length as $total | "Total: \($total)\nDaily Average: \(add/length)"' pageviews.json >> usage-report.md
+          
+          echo "## User Sessions" >> usage-report.md
+          jq -r '.MetricDataResults[0].Values | length as $total | "Total: \($total)\nDaily Average: \(add/length)"' sessions.json >> usage-report.md
+
+      - name: Upload usage results
+        uses: actions/upload-artifact@v3
+        with:
+          name: usage-results
+          path: |
+            pageviews.json
+            sessions.json
+            usage-report.md
+
+  performance:
+    name: Performance Analytics
+    needs: prepare
+    runs-on: ubuntu-latest
+    if: github.event.inputs.analysis_type == 'all' || github.event.inputs.analysis_type == 'performance'
+    
+    steps:
+      - name: Analyze response times
+        run: |
+          aws cloudwatch get-metric-data \
+            --metric-data-queries '[{
+              "Id": "response_times",
+              "MetricStat": {
+                "Metric": {
+                  "Namespace": "AWEAcademy",
+                  "MetricName": "ResponseTime"
+                },
+                "Period": 3600,
+                "Stat": "Average"
+              },
+              "ReturnData": true
+            }]' \
+            --start-time "${{ needs.prepare.outputs.start_date }}T00:00:00Z" \
+            --end-time "${{ needs.prepare.outputs.end_date }}T23:59:59Z" \
+            > response_times.json
+
+      - name: Analyze error rates
+        run: |
+          aws cloudwatch get-metric-data \
+            --metric-data-queries '[{
+              "Id": "errors",
+              "MetricStat": {
+                "Metric": {
+                  "Namespace": "AWEAcademy",
+                  "MetricName": "ErrorRate"
+                },
+                "Period": 3600,
+                "Stat": "Average"
+              },
+              "ReturnData": true
+            }]' \
+            --start-time "${{ needs.prepare.outputs.start_date }}T00:00:00Z" \
+            --end-time "${{ needs.prepare.outputs.end_date }}T23:59:59Z" \
+            > error_rates.json
+
+      - name: Generate performance report
+        run: |
+          echo "# Performance Analytics Report" > performance-report.md
+          echo "## Analysis ID: ${{ needs.prepare.outputs.analysis_id }}" >> performance-report.md
+          echo "## Time Range: ${{ needs.prepare.outputs.start_date }} to ${{ needs.prepare.outputs.end_date }}" >> performance-report.md
+          
+          echo "## Response Times" >> performance-report.md
+          jq -r '.MetricDataResults[0].Values | "Average: \(add/length)ms\nMax: \(max)ms\nMin: \(min)ms"' response_times.json >> performance-report.md
+          
+          echo "## Error Rates" >> performance-report.md
+          jq -r '.MetricDataResults[0].Values | "Average: \(add/length)%\nMax: \(max)%\nMin: \(min)%"' error_rates.json >> performance-report.md
+
+      - name: Upload performance results
+        uses: actions/upload-artifact@v3
+        with:
+          name: performance-results
+          path: |
+            response_times.json
+            error_rates.json
+            performance-report.md
+
+  user:
+    name: User Analytics
+    needs: prepare
+    runs-on: ubuntu-latest
+    if: github.event.inputs.analysis_type == 'all' || github.event.inputs.analysis_type == 'user'
+    
+    steps:
+      - name: Analyze user engagement
+        run: |
+          aws athena start-query-execution \
+            --query-string "
+              SELECT 
+                user_id,
+                COUNT(*) as total_actions,
+                AVG(session_duration) as avg_session_duration
+              FROM user_events
+              WHERE date BETWEEN '${{ needs.prepare.outputs.start_date }}' AND '${{ needs.prepare.outputs.end_date }}'
+              GROUP BY user_id
+            " \
+            --result-configuration "OutputLocation=s3://${{ secrets.ANALYTICS_BUCKET }}/user_engagement/" \
+            > user_engagement.json
+
+      - name: Analyze user retention
+        run: |
+          aws athena start-query-execution \
+            --query-string "
+              WITH first_visit AS (
+                SELECT 
+                  user_id,
+                  MIN(date) as first_date
+                FROM user_events
+                GROUP BY user_id
+              )
+              SELECT 
+                COUNT(DISTINCT CASE WHEN days_between >= 7 THEN user_id END) as retained_users,
+                COUNT(DISTINCT user_id) as total_users
+              FROM (
+                SELECT 
+                  e.user_id,
+                  DATEDIFF(e.date, f.first_date) as days_between
+                FROM user_events e
+                JOIN first_visit f ON e.user_id = f.user_id
+              )
+            " \
+            --result-configuration "OutputLocation=s3://${{ secrets.ANALYTICS_BUCKET }}/user_retention/" \
+            > user_retention.json
+
+      - name: Generate user report
+        run: |
+          echo "# User Analytics Report" > user-report.md
+          echo "## Analysis ID: ${{ needs.prepare.outputs.analysis_id }}" >> user-report.md
+          echo "## Time Range: ${{ needs.prepare.outputs.start_date }} to ${{ needs.prepare.outputs.end_date }}" >> user-report.md
+          
+          echo "## User Engagement" >> user-report.md
+          jq -r '.ResultSet.Rows | "Total Users: \(length-1)\nAverage Actions per User: \(.[1:] | map(.Data[1].VarCharValue | tonumber) | add/length)\nAverage Session Duration: \(.[1:] | map(.Data[2].VarCharValue | tonumber) | add/length) minutes"' user_engagement.json >> user-report.md
+          
+          echo "## User Retention" >> user-report.md
+          jq -r '.ResultSet.Rows[1].Data | "Retained Users: \(.[0].VarCharValue)\nRetention Rate: \((.[0].VarCharValue | tonumber)/(.[1].VarCharValue | tonumber)*100)%"' user_retention.json >> user-report.md
+
+      - name: Upload user results
+        uses: actions/upload-artifact@v3
+        with:
+          name: user-results
+          path: |
+            user_engagement.json
+            user_retention.json
+            user-report.md
+
+  business:
+    name: Business Analytics
+    needs: prepare
+    runs-on: ubuntu-latest
+    if: github.event.inputs.analysis_type == 'all' || github.event.inputs.analysis_type == 'business'
+    
+    steps:
+      - name: Analyze revenue
+        run: |
+          aws athena start-query-execution \
+            --query-string "
+              SELECT 
+                DATE_TRUNC('day', payment_date) as date,
+                SUM(amount) as daily_revenue,
+                COUNT(*) as transaction_count
+              FROM payments
+              WHERE payment_date BETWEEN '${{ needs.prepare.outputs.start_date }}' AND '${{ needs.prepare.outputs.end_date }}'
+              GROUP BY DATE_TRUNC('day', payment_date)
+              ORDER BY date
+            " \
+            --result-configuration "OutputLocation=s3://${{ secrets.ANALYTICS_BUCKET }}/revenue/" \
+            > revenue.json
+
+      - name: Analyze student metrics
+        run: |
+          aws athena start-query-execution \
+            --query-string "
+              SELECT 
+                COUNT(DISTINCT student_id) as total_students,
+                COUNT(DISTINCT CASE WHEN status = 'active' THEN student_id END) as active_students,
+                COUNT(DISTINCT CASE WHEN created_at BETWEEN '${{ needs.prepare.outputs.start_date }}' AND '${{ needs.prepare.outputs.end_date }}' THEN student_id END) as new_students
+              FROM students
+            " \
+            --result-configuration "OutputLocation=s3://${{ secrets.ANALYTICS_BUCKET }}/students/" \
+            > students.json
+
+      - name: Generate business report
+        run: |
+          echo "# Business Analytics Report" > business-report.md
+          echo "## Analysis ID: ${{ needs.prepare.outputs.analysis_id }}" >> business-report.md
+          echo "## Time Range: ${{ needs.prepare.outputs.start_date }} to ${{ needs.prepare.outputs.end_date }}" >> business-report.md
+          
+          echo "## Revenue Analysis" >> business-report.md
+          jq -r '.ResultSet.Rows[1:] | map(.Data) | "Total Revenue: $\(map(.[1].VarCharValue | tonumber) | add)\nAverage Daily Revenue: $\(map(.[1].VarCharValue | tonumber) | add/length)\nTotal Transactions: \(map(.[2].VarCharValue | tonumber) | add)"' revenue.json >> business-report.md
+          
+          echo "## Student Metrics" >> business-report.md
+          jq -r '.ResultSet.Rows[1].Data | "Total Students: \(.[0].VarCharValue)\nActive Students: \(.[1].VarCharValue)\nNew Students: \(.[2].VarCharValue)"' students.json >> business-report.md
+
+      - name: Upload business results
+        uses: actions/upload-artifact@v3
+        with:
+          name: business-results
+          path: |
+            revenue.json
+            students.json
+            business-report.md
+
+  consolidate:
+    name: Consolidate Reports
+    needs: [prepare, usage, performance, user, business]
+    runs-on: ubuntu-latest
+    if: always()
+    
+    steps:
+      - name: Download all reports
+        uses: actions/download-artifact@v3
+
+      - name: Generate consolidated report
+        run: |
+          echo "# Analytics Report" > consolidated-report.md
+          echo "## Analysis ID: ${{ needs.prepare.outputs.analysis_id }}" >> consolidated-report.md
+          echo "## Time Range: ${{ needs.prepare.outputs.start_date }} to ${{ needs.prepare.outputs.end_date }}" >> consolidated-report.md
+          
+          echo "## Usage Analytics" >> consolidated-report.md
+          cat usage-results/usage-report.md >> consolidated-report.md
+          
+          echo "## Performance Analytics" >> consolidated-report.md
+          cat performance-results/performance-report.md >> consolidated-report.md
+          
+          echo "## User Analytics" >> consolidated-report.md
+          cat user-results/user-report.md >> consolidated-report.md
+          
+          echo "## Business Analytics" >> consolidated-report.md
+          cat business-results/business-report.md >> consolidated-report.md
+
+      - name: Upload consolidated report
+        uses: actions/upload-artifact@v3
+        with:
+          name: consolidated-report
+          path: consolidated-report.md
+
+  notify:
+    name: Send Notifications
+    needs: [prepare, consolidate]
+    runs-on: ubuntu-latest
+    if: always()
+    
+    steps:
+      - name: Download consolidated report
+        uses: actions/download-artifact@v3
+        with:
+          name: consolidated-report
+
+      - name: Send Slack notification
+        uses: slackapi/slack-github-action@v1.24.0
+        with:
+          channel-id: 'analytics'
+          slack-message: |
+            :chart_with_upwards_trend: Analytics Report
+            
+            Analysis ID: ${{ needs.prepare.outputs.analysis_id }}
+            Time Range: ${{ needs.prepare.outputs.start_date }} to ${{ needs.prepare.outputs.end_date }}
+            
+            Status:
+            - Usage Analytics: ${{ needs.usage.result }}
+            - Performance Analytics: ${{ needs.performance.result }}
+            - User Analytics: ${{ needs.user.result }}
+            - Business Analytics: ${{ needs.business.result }}
+            
+            View detailed report: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+
+      - name: Send email notification
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: ${{ secrets.SMTP_SERVER }}
+          server_port: ${{ secrets.SMTP_PORT }}
+          username: ${{ secrets.SMTP_USERNAME }}
+          password: ${{ secrets.SMTP_PASSWORD }}
+          subject: "Analytics Report - ${{ needs.prepare.outputs.start_date }} to ${{ needs.prepare.outputs.end_date }}"
+          body: file://consolidated-report.md
+          to: analytics@aweacademy.com
+          from: AWE Academy Analytics <analytics@aweacademy.com>
