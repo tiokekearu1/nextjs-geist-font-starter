@@ -1,0 +1,194 @@
+name: Code Quality
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+  schedule:
+    - cron: '0 1 * * 1'  # Run weekly on Mondays at 1 AM UTC
+
+jobs:
+  php-quality:
+    name: PHP Quality Checks
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.1'
+          extensions: mbstring, intl, gd, xml, zip, pdo_mysql
+          tools: phpcs, phpmd, phpcpd, phploc, pdepend
+
+      - name: Get Composer cache directory
+        id: composer-cache
+        run: echo "dir=$(composer config cache-files-dir)" >> $GITHUB_OUTPUT
+
+      - name: Cache Composer dependencies
+        uses: actions/cache@v3
+        with:
+          path: ${{ steps.composer-cache.outputs.dir }}
+          key: ${{ runner.os }}-composer-${{ hashFiles('**/composer.lock') }}
+          restore-keys: ${{ runner.os }}-composer-
+
+      - name: Install dependencies
+        run: composer install --prefer-dist --no-progress
+
+      - name: Run PHP_CodeSniffer
+        run: phpcs --standard=PSR12 src modules tests
+
+      - name: Run PHP Mess Detector
+        run: phpmd src,modules,tests text cleancode,codesize,controversial,design,naming,unusedcode
+
+      - name: Run PHP Copy/Paste Detector
+        run: phpcpd src modules tests
+
+      - name: Run PHP Lines of Code
+        run: phploc src modules tests
+
+      - name: Run PHP Depend
+        run: pdepend --summary-xml=pdepend.xml src modules tests
+
+      - name: Run PHP Magic Number Detector
+        run: phpmd src,modules,tests text controversial
+
+      - name: Upload PHP quality reports
+        uses: actions/upload-artifact@v3
+        with:
+          name: php-quality-reports
+          path: |
+            pdepend.xml
+            phploc.xml
+
+  js-quality:
+    name: JavaScript Quality Checks
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '16'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run ESLint
+        run: npm run lint
+
+      - name: Run Prettier
+        run: npm run format:check
+
+      - name: Run TypeScript compiler
+        run: npm run type-check
+
+      - name: Run JavaScript complexity analysis
+        run: npx complexity-report-html resources/js/**/*.js --output complexity-report
+
+      - name: Upload JS quality reports
+        uses: actions/upload-artifact@v3
+        with:
+          name: js-quality-reports
+          path: complexity-report
+
+  sonarcloud:
+    name: SonarCloud Analysis
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+
+      - name: SonarCloud Scan
+        uses: SonarSource/sonarcloud-github-action@master
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+
+  codeclimate:
+    name: CodeClimate Analysis
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Run CodeClimate analysis
+        uses: paambaati/codeclimate-action@v4.0.0
+        env:
+          CC_TEST_REPORTER_ID: ${{ secrets.CC_TEST_REPORTER_ID }}
+        with:
+          coverageCommand: composer test:coverage
+
+  metrics:
+    name: Code Metrics
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Generate code metrics
+        uses: repository-metrics/action@v1
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          repository: ${{ github.repository }}
+
+      - name: Upload metrics report
+        uses: actions/upload-artifact@v3
+        with:
+          name: code-metrics
+          path: metrics-report
+
+  report:
+    name: Generate Quality Report
+    needs: [php-quality, js-quality, sonarcloud, codeclimate, metrics]
+    runs-on: ubuntu-latest
+    if: always()
+    
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v3
+
+      - name: Generate consolidated report
+        run: |
+          echo "# Code Quality Report" > quality-report.md
+          echo "## Status" >> quality-report.md
+          echo "- PHP Quality: ${{ needs.php-quality.result }}" >> quality-report.md
+          echo "- JS Quality: ${{ needs.js-quality.result }}" >> quality-report.md
+          echo "- SonarCloud: ${{ needs.sonarcloud.result }}" >> quality-report.md
+          echo "- CodeClimate: ${{ needs.codeclimate.result }}" >> quality-report.md
+          echo "- Metrics: ${{ needs.metrics.result }}" >> quality-report.md
+
+      - name: Upload consolidated report
+        uses: actions/upload-artifact@v3
+        with:
+          name: quality-report
+          path: quality-report.md
+
+      - name: Send Slack notification
+        uses: slackapi/slack-github-action@v1.24.0
+        if: always()
+        with:
+          channel-id: 'code-quality'
+          slack-message: |
+            Code Quality Check Results:
+            - PHP Quality: ${{ needs.php-quality.result }}
+            - JS Quality: ${{ needs.js-quality.result }}
+            - SonarCloud: ${{ needs.sonarcloud.result }}
+            - CodeClimate: ${{ needs.codeclimate.result }}
+            - Metrics: ${{ needs.metrics.result }}
+            
+            Details: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
