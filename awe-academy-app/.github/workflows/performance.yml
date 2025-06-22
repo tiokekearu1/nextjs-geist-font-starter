@@ -1,0 +1,353 @@
+name: Performance Testing
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    types: [ opened, synchronize ]
+  schedule:
+    - cron: '0 0 * * 0'  # Run weekly on Sundays
+  workflow_dispatch:
+    inputs:
+      test_type:
+        description: 'Type of performance test'
+        required: true
+        type: choice
+        options:
+          - all
+          - load
+          - stress
+          - endurance
+          - spike
+      test_duration:
+        description: 'Test duration (minutes)'
+        required: true
+        default: '5'
+        type: string
+      concurrent_users:
+        description: 'Number of concurrent users'
+        required: true
+        default: '100'
+        type: string
+
+jobs:
+  prepare:
+    name: Prepare Testing Environment
+    runs-on: ubuntu-latest
+    
+    outputs:
+      test_id: ${{ steps.generate.outputs.id }}
+      base_url: ${{ steps.environment.outputs.url }}
+    
+    steps:
+      - name: Generate test ID
+        id: generate
+        run: echo "id=$(date +%Y%m%d_%H%M%S)_$RANDOM" >> $GITHUB_OUTPUT
+
+      - name: Set environment URL
+        id: environment
+        run: echo "url=http://localhost:8000" >> $GITHUB_OUTPUT
+
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '16'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: |
+          npm install -g artillery newman lighthouse
+          npm ci
+
+      - name: Start application
+        run: |
+          npm run build
+          PORT=8000 npm run start &
+          sleep 10
+
+  lighthouse:
+    name: Lighthouse Performance Testing
+    needs: prepare
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Run Lighthouse tests
+        run: |
+          lighthouse ${{ needs.prepare.outputs.base_url }} \
+            --output json,html \
+            --output-path ./lighthouse-report \
+            --chrome-flags="--headless --no-sandbox" \
+            --form-factor=desktop
+
+      - name: Generate Lighthouse report
+        run: |
+          echo "# Lighthouse Performance Report" > lighthouse-summary.md
+          echo "## Test ID: ${{ needs.prepare.outputs.test_id }}" >> lighthouse-summary.md
+          
+          echo "## Performance Metrics" >> lighthouse-summary.md
+          jq -r '.categories.performance | "Score: \(.score * 100)%"' lighthouse-report.report.json >> lighthouse-summary.md
+          
+          echo "### Core Web Vitals" >> lighthouse-summary.md
+          jq -r '.audits["first-contentful-paint"] | "FCP: \(.displayValue)"' lighthouse-report.report.json >> lighthouse-summary.md
+          jq -r '.audits["largest-contentful-paint"] | "LCP: \(.displayValue)"' lighthouse-report.report.json >> lighthouse-summary.md
+          jq -r '.audits["cumulative-layout-shift"] | "CLS: \(.displayValue)"' lighthouse-report.report.json >> lighthouse-summary.md
+          jq -r '.audits["total-blocking-time"] | "TBT: \(.displayValue)"' lighthouse-report.report.json >> lighthouse-summary.md
+
+      - name: Upload Lighthouse results
+        uses: actions/upload-artifact@v3
+        with:
+          name: lighthouse-results
+          path: |
+            lighthouse-report/
+            lighthouse-summary.md
+
+  load:
+    name: Load Testing
+    needs: prepare
+    runs-on: ubuntu-latest
+    if: github.event.inputs.test_type == 'all' || github.event.inputs.test_type == 'load'
+    
+    steps:
+      - name: Create Artillery config
+        run: |
+          echo "
+          config:
+            target: '${{ needs.prepare.outputs.base_url }}'
+            phases:
+              - duration: ${{ github.event.inputs.test_duration || 5 }}
+                arrivalRate: ${{ github.event.inputs.concurrent_users || 100 }}
+            defaults:
+              headers:
+                User-Agent: 'Artillery Load Test'
+          scenarios:
+            - name: 'Basic user flow'
+              flow:
+                - get:
+                    url: '/'
+                - think: 2
+                - get:
+                    url: '/dashboard'
+                - think: 2
+                - get:
+                    url: '/students'
+                - think: 2
+                - get:
+                    url: '/fees'
+          " > load-test.yml
+
+      - name: Run load tests
+        run: artillery run --output load-test-results.json load-test.yml
+
+      - name: Generate load test report
+        run: |
+          artillery report load-test-results.json --output load-test-report.html
+          
+          echo "# Load Test Report" > load-test-summary.md
+          echo "## Test ID: ${{ needs.prepare.outputs.test_id }}" >> load-test-summary.md
+          
+          echo "## Test Configuration" >> load-test-summary.md
+          echo "- Duration: ${{ github.event.inputs.test_duration || 5 }} minutes" >> load-test-summary.md
+          echo "- Concurrent Users: ${{ github.event.inputs.concurrent_users || 100 }}" >> load-test-summary.md
+          
+          echo "## Results" >> load-test-summary.md
+          jq -r '.aggregate.latency | "Average Response Time: \(.median)ms (median)"' load-test-results.json >> load-test-summary.md
+          jq -r '.aggregate.rps | "Requests per Second: \(.mean)"' load-test-results.json >> load-test-summary.md
+          jq -r '.aggregate.codes | "Status Codes: \(.)"' load-test-results.json >> load-test-summary.md
+
+      - name: Upload load test results
+        uses: actions/upload-artifact@v3
+        with:
+          name: load-test-results
+          path: |
+            load-test-results.json
+            load-test-report.html
+            load-test-summary.md
+
+  stress:
+    name: Stress Testing
+    needs: prepare
+    runs-on: ubuntu-latest
+    if: github.event.inputs.test_type == 'all' || github.event.inputs.test_type == 'stress'
+    
+    steps:
+      - name: Create stress test config
+        run: |
+          echo "
+          config:
+            target: '${{ needs.prepare.outputs.base_url }}'
+            phases:
+              - duration: 1
+                arrivalRate: 1
+                rampTo: ${{ github.event.inputs.concurrent_users || 100 }}
+              - duration: ${{ github.event.inputs.test_duration || 5 }}
+                arrivalRate: ${{ github.event.inputs.concurrent_users || 100 }}
+              - duration: 1
+                arrivalRate: ${{ github.event.inputs.concurrent_users || 100 }}
+                rampTo: 1
+          " > stress-test.yml
+
+      - name: Run stress tests
+        run: artillery run --output stress-test-results.json stress-test.yml
+
+      - name: Generate stress test report
+        run: |
+          artillery report stress-test-results.json --output stress-test-report.html
+          
+          echo "# Stress Test Report" > stress-test-summary.md
+          echo "## Test ID: ${{ needs.prepare.outputs.test_id }}" >> stress-test-summary.md
+          
+          jq -r '.aggregate.latency | "Response Times (ms):\n- Min: \(.min)\n- Max: \(.max)\n- Median: \(.median)"' stress-test-results.json >> stress-test-summary.md
+          jq -r '.aggregate.rps | "Throughput: \(.mean) req/sec"' stress-test-results.json >> stress-test-summary.md
+          jq -r '.aggregate.errors | "Errors: \(.)"' stress-test-results.json >> stress-test-summary.md
+
+      - name: Upload stress test results
+        uses: actions/upload-artifact@v3
+        with:
+          name: stress-test-results
+          path: |
+            stress-test-results.json
+            stress-test-report.html
+            stress-test-summary.md
+
+  api:
+    name: API Performance Testing
+    needs: prepare
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Create API test collection
+        run: |
+          echo '{
+            "info": {
+              "name": "API Performance Tests",
+              "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+            },
+            "item": [
+              {
+                "name": "Get Students",
+                "request": {
+                  "method": "GET",
+                  "url": "${{ needs.prepare.outputs.base_url }}/api/students"
+                }
+              },
+              {
+                "name": "Get Fees",
+                "request": {
+                  "method": "GET",
+                  "url": "${{ needs.prepare.outputs.base_url }}/api/fees"
+                }
+              }
+            ]
+          }' > api-tests.json
+
+      - name: Run API tests
+        run: |
+          newman run api-tests.json \
+            -n ${{ github.event.inputs.concurrent_users || 100 }} \
+            --reporters cli,json \
+            --reporter-json-export api-test-results.json
+
+      - name: Generate API test report
+        run: |
+          echo "# API Performance Report" > api-test-summary.md
+          echo "## Test ID: ${{ needs.prepare.outputs.test_id }}" >> api-test-summary.md
+          
+          jq -r '.run.stats | "## Test Statistics\n- Total Requests: \(.requests.total)\n- Failed Requests: \(.requests.failed)\n- Average Response Time: \(.responseAverage)ms"' api-test-results.json >> api-test-summary.md
+          
+          echo "## Endpoint Performance" >> api-test-summary.md
+          jq -r '.run.executions[] | "### \(.item.name)\n- Response Time: \(.response.responseTime)ms\n- Status: \(.response.code)"' api-test-results.json >> api-test-summary.md
+
+      - name: Upload API test results
+        uses: actions/upload-artifact@v3
+        with:
+          name: api-test-results
+          path: |
+            api-test-results.json
+            api-test-summary.md
+
+  consolidate:
+    name: Consolidate Reports
+    needs: [prepare, lighthouse, load, stress, api]
+    runs-on: ubuntu-latest
+    if: always()
+    
+    steps:
+      - name: Download all reports
+        uses: actions/download-artifact@v3
+
+      - name: Generate consolidated report
+        run: |
+          echo "# Performance Testing Report" > consolidated-report.md
+          echo "## Test ID: ${{ needs.prepare.outputs.test_id }}" >> consolidated-report.md
+          
+          echo "## Lighthouse Results" >> consolidated-report.md
+          cat lighthouse-results/lighthouse-summary.md >> consolidated-report.md
+          
+          echo "## Load Test Results" >> consolidated-report.md
+          cat load-test-results/load-test-summary.md >> consolidated-report.md
+          
+          echo "## Stress Test Results" >> consolidated-report.md
+          cat stress-test-results/stress-test-summary.md >> consolidated-report.md
+          
+          echo "## API Test Results" >> consolidated-report.md
+          cat api-test-results/api-test-summary.md >> consolidated-report.md
+
+      - name: Upload consolidated report
+        uses: actions/upload-artifact@v3
+        with:
+          name: consolidated-report
+          path: consolidated-report.md
+
+  notify:
+    name: Send Notifications
+    needs: [prepare, consolidate]
+    runs-on: ubuntu-latest
+    if: always()
+    
+    steps:
+      - name: Download consolidated report
+        uses: actions/download-artifact@v3
+        with:
+          name: consolidated-report
+
+      - name: Send Slack notification
+        uses: slackapi/slack-github-action@v1.24.0
+        with:
+          channel-id: 'performance'
+          slack-message: |
+            :chart_with_upwards_trend: Performance Testing Complete
+            
+            Test ID: ${{ needs.prepare.outputs.test_id }}
+            Type: ${{ github.event.inputs.test_type || 'all' }}
+            
+            Status:
+            - Lighthouse: ${{ needs.lighthouse.result }}
+            - Load Tests: ${{ needs.load.result }}
+            - Stress Tests: ${{ needs.stress.result }}
+            - API Tests: ${{ needs.api.result }}
+            
+            View detailed report: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+
+      - name: Send email notification
+        if: failure()
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: ${{ secrets.SMTP_SERVER }}
+          server_port: ${{ secrets.SMTP_PORT }}
+          username: ${{ secrets.SMTP_USERNAME }}
+          password: ${{ secrets.SMTP_PASSWORD }}
+          subject: "Performance Testing Failed"
+          body: |
+            Performance testing has failed.
+            
+            Test ID: ${{ needs.prepare.outputs.test_id }}
+            Type: ${{ github.event.inputs.test_type || 'all' }}
+            
+            Check the detailed report: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          to: performance@aweacademy.com
+          from: AWE Academy Performance <performance@aweacademy.com>
