@@ -1,0 +1,331 @@
+name: Notifications Management
+
+on:
+  workflow_dispatch:
+    inputs:
+      notification_type:
+        description: 'Type of notification to send'
+        required: true
+        type: choice
+        options:
+          - system
+          - maintenance
+          - security
+          - performance
+          - user
+      urgency_level:
+        description: 'Urgency level'
+        required: true
+        default: 'normal'
+        type: choice
+        options:
+          - low
+          - normal
+          - high
+          - critical
+      target_audience:
+        description: 'Target audience'
+        required: true
+        type: choice
+        options:
+          - all
+          - users
+          - staff
+          - admins
+          - developers
+      channels:
+        description: 'Notification channels'
+        required: true
+        type: choice
+        options:
+          - all
+          - email
+          - slack
+          - sms
+          - push
+
+jobs:
+  prepare:
+    name: Prepare Notifications
+    runs-on: ubuntu-latest
+    
+    outputs:
+      notification_id: ${{ steps.generate.outputs.id }}
+      timestamp: ${{ steps.generate.outputs.time }}
+    
+    steps:
+      - name: Generate notification ID
+        id: generate
+        run: |
+          echo "id=$(date +%Y%m%d_%H%M%S)_$RANDOM" >> $GITHUB_OUTPUT
+          echo "time=$(date -u +"%Y-%m-%dT%H:%M:%SZ")" >> $GITHUB_OUTPUT
+
+      - name: Prepare notification content
+        run: |
+          case "${{ github.event.inputs.notification_type }}" in
+            "system")
+              title="System Update Notification"
+              template="system-notification.md"
+              ;;
+            "maintenance")
+              title="Scheduled Maintenance Notice"
+              template="maintenance-notification.md"
+              ;;
+            "security")
+              title="Security Alert"
+              template="security-notification.md"
+              ;;
+            "performance")
+              title="Performance Update"
+              template="performance-notification.md"
+              ;;
+            "user")
+              title="User Update Notice"
+              template="user-notification.md"
+              ;;
+          esac
+          
+          echo "NOTIFICATION_TITLE=$title" >> $GITHUB_ENV
+          echo "TEMPLATE_FILE=$template" >> $GITHUB_ENV
+
+  email:
+    name: Send Email Notifications
+    needs: prepare
+    runs-on: ubuntu-latest
+    if: github.event.inputs.channels == 'all' || github.event.inputs.channels == 'email'
+    
+    steps:
+      - name: Prepare email list
+        run: |
+          case "${{ github.event.inputs.target_audience }}" in
+            "all")
+              echo "all-users@aweacademy.com" > email-list.txt
+              ;;
+            "users")
+              aws dynamodb scan \
+                --table-name users \
+                --filter-expression "user_type = :type" \
+                --expression-attribute-values '{":type": {"S": "student"}}' \
+                --projection-expression "email" \
+                --output text > email-list.txt
+              ;;
+            "staff")
+              aws dynamodb scan \
+                --table-name users \
+                --filter-expression "user_type = :type" \
+                --expression-attribute-values '{":type": {"S": "staff"}}' \
+                --projection-expression "email" \
+                --output text > email-list.txt
+              ;;
+            "admins")
+              echo "admins@aweacademy.com" > email-list.txt
+              ;;
+            "developers")
+              echo "dev-team@aweacademy.com" > email-list.txt
+              ;;
+          esac
+
+      - name: Send email notifications
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: ${{ secrets.SMTP_SERVER }}
+          server_port: ${{ secrets.SMTP_PORT }}
+          username: ${{ secrets.SMTP_USERNAME }}
+          password: ${{ secrets.SMTP_PASSWORD }}
+          subject: "${{ env.NOTIFICATION_TITLE }}"
+          body: file://${{ env.TEMPLATE_FILE }}
+          to_file: email-list.txt
+          from: AWE Academy Notifications <notifications@aweacademy.com>
+          priority: ${{ github.event.inputs.urgency_level }}
+
+  slack:
+    name: Send Slack Notifications
+    needs: prepare
+    runs-on: ubuntu-latest
+    if: github.event.inputs.channels == 'all' || github.event.inputs.channels == 'slack'
+    
+    steps:
+      - name: Determine Slack channel
+        run: |
+          case "${{ github.event.inputs.target_audience }}" in
+            "all")
+              echo "SLACK_CHANNEL=general" >> $GITHUB_ENV
+              ;;
+            "users")
+              echo "SLACK_CHANNEL=users" >> $GITHUB_ENV
+              ;;
+            "staff")
+              echo "SLACK_CHANNEL=staff" >> $GITHUB_ENV
+              ;;
+            "admins")
+              echo "SLACK_CHANNEL=admins" >> $GITHUB_ENV
+              ;;
+            "developers")
+              echo "SLACK_CHANNEL=dev-team" >> $GITHUB_ENV
+              ;;
+          esac
+
+      - name: Send Slack notification
+        uses: slackapi/slack-github-action@v1.24.0
+        with:
+          channel-id: ${{ env.SLACK_CHANNEL }}
+          slack-message: |
+            :bell: *${{ env.NOTIFICATION_TITLE }}*
+            
+            Type: ${{ github.event.inputs.notification_type }}
+            Urgency: ${{ github.event.inputs.urgency_level }}
+            ID: ${{ needs.prepare.outputs.notification_id }}
+            
+            Content from template: ${{ env.TEMPLATE_FILE }}
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+
+  sms:
+    name: Send SMS Notifications
+    needs: prepare
+    runs-on: ubuntu-latest
+    if: github.event.inputs.channels == 'all' || github.event.inputs.channels == 'sms'
+    
+    steps:
+      - name: Prepare phone numbers
+        run: |
+          case "${{ github.event.inputs.target_audience }}" in
+            "all")
+              aws dynamodb scan \
+                --table-name users \
+                --projection-expression "phone_number" \
+                --output text > phone-list.txt
+              ;;
+            *)
+              aws dynamodb scan \
+                --table-name users \
+                --filter-expression "user_type = :type" \
+                --expression-attribute-values '{":type": {"S": "${{ github.event.inputs.target_audience }}"}}' \
+                --projection-expression "phone_number" \
+                --output text > phone-list.txt
+              ;;
+          esac
+
+      - name: Send SMS notifications
+        run: |
+          while read -r phone; do
+            aws sns publish \
+              --phone-number "$phone" \
+              --message "${{ env.NOTIFICATION_TITLE }}: $(cat ${{ env.TEMPLATE_FILE }})"
+          done < phone-list.txt
+
+  push:
+    name: Send Push Notifications
+    needs: prepare
+    runs-on: ubuntu-latest
+    if: github.event.inputs.channels == 'all' || github.event.inputs.channels == 'push'
+    
+    steps:
+      - name: Prepare device tokens
+        run: |
+          case "${{ github.event.inputs.target_audience }}" in
+            "all")
+              aws dynamodb scan \
+                --table-name users \
+                --projection-expression "device_token" \
+                --output text > device-tokens.txt
+              ;;
+            *)
+              aws dynamodb scan \
+                --table-name users \
+                --filter-expression "user_type = :type" \
+                --expression-attribute-values '{":type": {"S": "${{ github.event.inputs.target_audience }}"}}' \
+                --projection-expression "device_token" \
+                --output text > device-tokens.txt
+              ;;
+          esac
+
+      - name: Send push notifications
+        run: |
+          while read -r token; do
+            curl -X POST \
+              -H "Authorization: key=${{ secrets.FCM_SERVER_KEY }}" \
+              -H "Content-Type: application/json" \
+              -d '{
+                "to": "'$token'",
+                "notification": {
+                  "title": "${{ env.NOTIFICATION_TITLE }}",
+                  "body": "$(cat ${{ env.TEMPLATE_FILE }})",
+                  "priority": "${{ github.event.inputs.urgency_level }}"
+                }
+              }' \
+              https://fcm.googleapis.com/fcm/send
+          done < device-tokens.txt
+
+  verify:
+    name: Verify Notifications
+    needs: [prepare, email, slack, sms, push]
+    runs-on: ubuntu-latest
+    if: always()
+    
+    steps:
+      - name: Generate verification report
+        run: |
+          echo "# Notification Delivery Report" > notification-report.md
+          echo "## Notification ID: ${{ needs.prepare.outputs.notification_id }}" >> notification-report.md
+          echo "## Timestamp: ${{ needs.prepare.outputs.timestamp }}" >> notification-report.md
+          
+          echo "## Delivery Status" >> notification-report.md
+          echo "- Email: ${{ needs.email.result }}" >> notification-report.md
+          echo "- Slack: ${{ needs.slack.result }}" >> notification-report.md
+          echo "- SMS: ${{ needs.sms.result }}" >> notification-report.md
+          echo "- Push: ${{ needs.push.result }}" >> notification-report.md
+
+      - name: Upload verification report
+        uses: actions/upload-artifact@v3
+        with:
+          name: notification-report
+          path: notification-report.md
+
+  log:
+    name: Log Notifications
+    needs: [prepare, verify]
+    runs-on: ubuntu-latest
+    if: always()
+    
+    steps:
+      - name: Log to CloudWatch
+        run: |
+          aws logs put-log-events \
+            --log-group-name "/aws/aweacademy/notifications" \
+            --log-stream-name "${{ needs.prepare.outputs.notification_id }}" \
+            --log-events "[{
+              \"timestamp\": $(date +%s%N | cut -b1-13),
+              \"message\": \"{
+                \\\"id\\\": \\\"${{ needs.prepare.outputs.notification_id }}\\\",
+                \\\"type\\\": \\\"${{ github.event.inputs.notification_type }}\\\",
+                \\\"urgency\\\": \\\"${{ github.event.inputs.urgency_level }}\\\",
+                \\\"audience\\\": \\\"${{ github.event.inputs.target_audience }}\\\",
+                \\\"channels\\\": \\\"${{ github.event.inputs.channels }}\\\",
+                \\\"status\\\": {
+                  \\\"email\\\": \\\"${{ needs.email.result }}\\\",
+                  \\\"slack\\\": \\\"${{ needs.slack.result }}\\\",
+                  \\\"sms\\\": \\\"${{ needs.sms.result }}\\\",
+                  \\\"push\\\": \\\"${{ needs.push.result }}\\\"
+                }
+              }\"
+            }]"
+
+      - name: Store in database
+        run: |
+          aws dynamodb put-item \
+            --table-name notifications \
+            --item '{
+              "id": {"S": "${{ needs.prepare.outputs.notification_id }}"},
+              "timestamp": {"S": "${{ needs.prepare.outputs.timestamp }}"},
+              "type": {"S": "${{ github.event.inputs.notification_type }}"},
+              "urgency": {"S": "${{ github.event.inputs.urgency_level }}"},
+              "audience": {"S": "${{ github.event.inputs.target_audience }}"},
+              "channels": {"S": "${{ github.event.inputs.channels }}"},
+              "status": {"M": {
+                "email": {"S": "${{ needs.email.result }}"},
+                "slack": {"S": "${{ needs.slack.result }}"},
+                "sms": {"S": "${{ needs.sms.result }}"},
+                "push": {"S": "${{ needs.push.result }}"}
+              }}
+            }'
