@@ -1,0 +1,347 @@
+name: Recovery Management
+
+on:
+  workflow_dispatch:
+    inputs:
+      recovery_type:
+        description: 'Type of recovery'
+        required: true
+        type: choice
+        options:
+          - system
+          - database
+          - files
+          - config
+      recovery_point:
+        description: 'Recovery point timestamp (YYYY-MM-DD-HH-MM)'
+        required: true
+        type: string
+      environment:
+        description: 'Target environment'
+        required: true
+        type: choice
+        options:
+          - development
+          - staging
+          - production
+      dry_run:
+        description: 'Perform dry run only'
+        required: true
+        default: 'true'
+        type: boolean
+
+jobs:
+  prepare:
+    name: Prepare Recovery
+    runs-on: ubuntu-latest
+    
+    outputs:
+      recovery_id: ${{ steps.generate.outputs.id }}
+      backup_path: ${{ steps.locate.outputs.path }}
+    
+    steps:
+      - name: Generate recovery ID
+        id: generate
+        run: echo "id=$(date +%Y%m%d_%H%M%S)_$RANDOM" >> $GITHUB_OUTPUT
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Locate backup
+        id: locate
+        run: |
+          backup_path="s3://${{ secrets.BACKUP_BUCKET }}/${{ github.event.inputs.environment }}/${{ github.event.inputs.recovery_point }}"
+          
+          # Verify backup exists
+          if aws s3 ls $backup_path &> /dev/null; then
+            echo "path=$backup_path" >> $GITHUB_OUTPUT
+          else
+            echo "Error: Backup not found at $backup_path"
+            exit 1
+          fi
+
+  validate:
+    name: Validate Recovery Point
+    needs: prepare
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Check backup integrity
+        run: |
+          aws s3 cp "${{ needs.prepare.outputs.backup_path }}/checksum.md5" ./
+          aws s3 cp "${{ needs.prepare.outputs.backup_path }}/manifest.json" ./
+          
+          # Verify checksums
+          while IFS= read -r line; do
+            file=$(echo $line | cut -d' ' -f2)
+            expected_md5=$(echo $line | cut -d' ' -f1)
+            
+            aws s3 cp "${{ needs.prepare.outputs.backup_path }}/$file" ./
+            actual_md5=$(md5sum $file | cut -d' ' -f1)
+            
+            if [[ "$expected_md5" != "$actual_md5" ]]; then
+              echo "Checksum mismatch for $file"
+              exit 1
+            fi
+          done < checksum.md5
+
+      - name: Validate backup structure
+        run: |
+          required_files=(
+            "system.tar.gz"
+            "database.sql"
+            "files.tar.gz"
+            "config.json"
+            "metadata.json"
+          )
+          
+          for file in "${required_files[@]}"; do
+            if ! aws s3 ls "${{ needs.prepare.outputs.backup_path }}/$file" &> /dev/null; then
+              echo "Missing required file: $file"
+              exit 1
+            fi
+          done
+
+  system:
+    name: System Recovery
+    needs: [prepare, validate]
+    runs-on: ubuntu-latest
+    if: github.event.inputs.recovery_type == 'system'
+    
+    steps:
+      - name: Stop services
+        if: github.event.inputs.dry_run != 'true'
+        run: |
+          aws ecs update-service \
+            --cluster aweacademy \
+            --service web \
+            --desired-count 0
+          
+          aws ecs update-service \
+            --cluster aweacademy \
+            --service api \
+            --desired-count 0
+
+      - name: Restore system state
+        if: github.event.inputs.dry_run != 'true'
+        run: |
+          aws s3 cp "${{ needs.prepare.outputs.backup_path }}/system.tar.gz" ./
+          tar -xzf system.tar.gz
+          
+          # Apply system configuration
+          aws ecs update-service \
+            --cluster aweacademy \
+            --service web \
+            --task-definition $(cat system/web-task-def.json)
+          
+          aws ecs update-service \
+            --cluster aweacademy \
+            --service api \
+            --task-definition $(cat system/api-task-def.json)
+
+      - name: Verify system state
+        run: |
+          aws ecs describe-services \
+            --cluster aweacademy \
+            --services web api \
+            --query 'services[*].[serviceName,status]' \
+            --output text
+
+  database:
+    name: Database Recovery
+    needs: [prepare, validate]
+    runs-on: ubuntu-latest
+    if: github.event.inputs.recovery_type == 'system' || github.event.inputs.recovery_type == 'database'
+    
+    steps:
+      - name: Create snapshot
+        run: |
+          aws rds create-db-snapshot \
+            --db-instance-identifier aweacademy-${{ github.event.inputs.environment }} \
+            --db-snapshot-identifier backup-${{ needs.prepare.outputs.recovery_id }}
+
+      - name: Restore database
+        if: github.event.inputs.dry_run != 'true'
+        run: |
+          aws s3 cp "${{ needs.prepare.outputs.backup_path }}/database.sql" ./
+          
+          mysql \
+            -h ${{ secrets.DB_HOST }} \
+            -u ${{ secrets.DB_USER }} \
+            -p${{ secrets.DB_PASSWORD }} \
+            ${{ secrets.DB_NAME }} < database.sql
+
+      - name: Verify database
+        run: |
+          mysql \
+            -h ${{ secrets.DB_HOST }} \
+            -u ${{ secrets.DB_USER }} \
+            -p${{ secrets.DB_PASSWORD }} \
+            -e "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = '${{ secrets.DB_NAME }}'"
+
+  files:
+    name: Files Recovery
+    needs: [prepare, validate]
+    runs-on: ubuntu-latest
+    if: github.event.inputs.recovery_type == 'system' || github.event.inputs.recovery_type == 'files'
+    
+    steps:
+      - name: Backup current files
+        run: |
+          aws s3 sync \
+            s3://${{ secrets.ASSETS_BUCKET }} \
+            s3://${{ secrets.BACKUP_BUCKET }}/pre-recovery-${{ needs.prepare.outputs.recovery_id }}
+
+      - name: Restore files
+        if: github.event.inputs.dry_run != 'true'
+        run: |
+          aws s3 cp "${{ needs.prepare.outputs.backup_path }}/files.tar.gz" ./
+          tar -xzf files.tar.gz
+          
+          aws s3 sync \
+            files/ \
+            s3://${{ secrets.ASSETS_BUCKET }}
+
+      - name: Verify files
+        run: |
+          aws s3 ls s3://${{ secrets.ASSETS_BUCKET }} --recursive | wc -l
+
+  config:
+    name: Configuration Recovery
+    needs: [prepare, validate]
+    runs-on: ubuntu-latest
+    if: github.event.inputs.recovery_type == 'system' || github.event.inputs.recovery_type == 'config'
+    
+    steps:
+      - name: Backup current config
+        run: |
+          aws ssm get-parameters-by-path \
+            --path "/aweacademy/${{ github.event.inputs.environment }}/" \
+            --recursive \
+            --with-decryption \
+            > current-config.json
+
+      - name: Restore configuration
+        if: github.event.inputs.dry_run != 'true'
+        run: |
+          aws s3 cp "${{ needs.prepare.outputs.backup_path }}/config.json" ./
+          
+          while IFS= read -r param; do
+            name=$(echo $param | jq -r '.Name')
+            value=$(echo $param | jq -r '.Value')
+            type=$(echo $param | jq -r '.Type')
+            
+            aws ssm put-parameter \
+              --name "$name" \
+              --value "$value" \
+              --type "$type" \
+              --overwrite
+          done < <(jq -c '.Parameters[]' config.json)
+
+      - name: Verify configuration
+        run: |
+          aws ssm get-parameters-by-path \
+            --path "/aweacademy/${{ github.event.inputs.environment }}/" \
+            --recursive \
+            --query 'Parameters[*].[Name]' \
+            --output text
+
+  verify:
+    name: Verify Recovery
+    needs: [prepare, system, database, files, config]
+    runs-on: ubuntu-latest
+    if: always()
+    
+    steps:
+      - name: Run health checks
+        run: |
+          # Check system health
+          curl -f https://${{ github.event.inputs.environment }}.aweacademy.com/health > system-health.json
+          
+          # Check database connectivity
+          mysql \
+            -h ${{ secrets.DB_HOST }} \
+            -u ${{ secrets.DB_USER }} \
+            -p${{ secrets.DB_PASSWORD }} \
+            -e "SELECT 1" > database-health.txt
+          
+          # Check file accessibility
+          aws s3 ls s3://${{ secrets.ASSETS_BUCKET }}/test.txt > files-health.txt
+          
+          # Check configuration
+          aws ssm get-parameter \
+            --name "/aweacademy/${{ github.event.inputs.environment }}/app/version" \
+            > config-health.json
+
+      - name: Generate verification report
+        run: |
+          echo "# Recovery Verification Report" > verification-report.md
+          echo "## Recovery ID: ${{ needs.prepare.outputs.recovery_id }}" >> verification-report.md
+          
+          echo "## System Health" >> verification-report.md
+          cat system-health.json >> verification-report.md
+          
+          echo "## Database Health" >> verification-report.md
+          cat database-health.txt >> verification-report.md
+          
+          echo "## Files Health" >> verification-report.md
+          cat files-health.txt >> verification-report.md
+          
+          echo "## Configuration Health" >> verification-report.md
+          cat config-health.json >> verification-report.md
+
+      - name: Upload verification report
+        uses: actions/upload-artifact@v3
+        with:
+          name: verification-report
+          path: verification-report.md
+
+  notify:
+    name: Send Notifications
+    needs: [prepare, verify]
+    runs-on: ubuntu-latest
+    if: always()
+    
+    steps:
+      - name: Download verification report
+        uses: actions/download-artifact@v3
+        with:
+          name: verification-report
+
+      - name: Send Slack notification
+        uses: slackapi/slack-github-action@v1.24.0
+        with:
+          channel-id: 'recovery'
+          slack-message: |
+            :arrows_counterclockwise: Recovery Operation Complete
+            
+            Recovery ID: ${{ needs.prepare.outputs.recovery_id }}
+            Type: ${{ github.event.inputs.recovery_type }}
+            Environment: ${{ github.event.inputs.environment }}
+            Mode: ${{ github.event.inputs.dry_run == 'true' && 'Dry Run' || 'Actual' }}
+            
+            Status:
+            - System: ${{ needs.system.result }}
+            - Database: ${{ needs.database.result }}
+            - Files: ${{ needs.files.result }}
+            - Config: ${{ needs.config.result }}
+            
+            View detailed report: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+
+      - name: Send email notification
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: ${{ secrets.SMTP_SERVER }}
+          server_port: ${{ secrets.SMTP_PORT }}
+          username: ${{ secrets.SMTP_USERNAME }}
+          password: ${{ secrets.SMTP_PASSWORD }}
+          subject: "Recovery Operation Complete - ${{ github.event.inputs.environment }}"
+          body: file://verification-report.md
+          to: ops@aweacademy.com
+          from: AWE Academy Recovery <recovery@aweacademy.com>
