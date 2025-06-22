@@ -1,0 +1,103 @@
+# This is a CODEOWNERS file to define individuals or teams responsible for code in this repository.
+# Each line is a file pattern followed by one or more owners.
+# Order is important; the last matching pattern takes precedence.
+
+# Default owners for everything in the repo
+* @tech-lead @security-team
+
+# Backend code
+/src/ @backend-lead
+/modules/ @backend-lead
+/includes/ @backend-lead
+/config/ @backend-lead @devops-lead
+/database/ @backend-lead @db-admin
+
+# Frontend code
+/resources/js/ @frontend-lead
+/resources/scss/ @frontend-lead
+/public/ @frontend-lead
+*.js @frontend-lead
+*.css @frontend-lead
+*.scss @frontend-lead
+
+# DevOps and Infrastructure
+/docker/ @devops-lead
+Dockerfile @devops-lead
+docker-compose.yml @devops-lead
+.env.example @devops-lead
+*.sh @devops-lead
+
+# CI/CD and GitHub Actions
+/.github/workflows/ @devops-lead
+/.github/actions/ @devops-lead
+
+# Testing
+/tests/ @qa-lead @backend-lead
+phpunit.xml @qa-lead
+jest.config.js @qa-lead
+
+# Documentation
+*.md @docs-team
+/docs/ @docs-team
+
+# Security-related files
+/security/ @security-team
+SECURITY.md @security-team
+.env.example @security-team
+
+# Package management
+composer.json @backend-lead
+composer.lock @backend-lead
+package.json @frontend-lead
+package-lock.json @frontend-lead
+yarn.lock @frontend-lead
+
+# Build configuration
+webpack.mix.js @frontend-lead
+.editorconfig @tech-lead
+.eslintrc @frontend-lead
+.prettierrc @frontend-lead
+.stylelintrc @frontend-lead
+
+# Database
+*.sql @db-admin
+/database/migrations/ @db-admin @backend-lead
+/database/seeds/ @db-admin @backend-lead
+
+# API documentation
+/api/ @backend-lead @docs-team
+swagger.yaml @backend-lead @docs-team
+
+# Monitoring and logging
+/monitoring/ @devops-lead
+/logs/ @devops-lead
+
+# Student module
+/modules/students/ @student-module-lead @backend-lead
+
+# Fees module
+/modules/fees/ @finance-module-lead @backend-lead
+
+# Payments module
+/modules/payments/ @finance-module-lead @backend-lead
+
+# Supplies module
+/modules/supplies/ @inventory-module-lead @backend-lead
+
+# Reports module
+/modules/reports/ @reporting-module-lead @backend-lead
+
+# User management
+/modules/users/ @security-team @backend-lead
+
+# Settings and configuration
+/modules/settings/ @tech-lead @backend-lead
+
+# Dependencies
+/vendor/ @backend-lead
+/node_modules/ @frontend-lead
+
+# Critical files requiring multiple reviews
+/config/app.php @tech-lead @security-team @backend-lead
+/config/database.php @tech-lead @db-admin @backend-lead
+/config/auth.php @tech-lead @security-team @backend-lead
