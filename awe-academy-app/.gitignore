@@ -1,0 +1,67 @@
+# Configuration files
+config/db.php
+.env
+
+# Dependency directories
+vendor/
+node_modules/
+
+# IDE and editor files
+.idea/
+.vscode/
+*.sublime-project
+*.sublime-workspace
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Uploaded files
+uploads/*
+!uploads/.gitkeep
+
+# Log files
+*.log
+error_log
+access_log
+php_errors.log
+
+# Cache files
+*.cache
+.sass-cache/
+*.css.map
+*.js.map
+
+# Temporary files
+*.tmp
+*.temp
+*.bak
+*.backup
+
+# Compiled files
+*.com
+*.class
+*.dll
+*.exe
+*.o
+*.so
+
+# Package files
+*.7z
+*.dmg
+*.gz
+*.iso
+*.jar
+*.rar
+*.tar
+*.zip
+
+# Database backups
+*.sql
+*.sqlite
+*.db
+
+# Environment specific files
+phpinfo.php
+info.php
+test.php
