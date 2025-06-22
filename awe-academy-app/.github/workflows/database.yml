@@ -1,0 +1,211 @@
+name: Database Management
+
+on:
+  push:
+    branches: [ main, develop ]
+    paths:
+      - 'database/migrations/**'
+      - 'database/seeds/**'
+      - 'database/schema.sql'
+  pull_request:
+    branches: [ main, develop ]
+    paths:
+      - 'database/migrations/**'
+      - 'database/seeds/**'
+      - 'database/schema.sql'
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to run migrations'
+        required: true
+        default: 'staging'
+        type: choice
+        options:
+          - staging
+          - production
+
+jobs:
+  validate:
+    name: Validate Schema
+    runs-on: ubuntu-latest
+    
+    services:
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: root
+          MYSQL_DATABASE: awe_academy_test
+        ports:
+          - 3306:3306
+        options: --health-cmd="mysqladmin ping" --health-interval=10s --health-timeout=5s --health-retries=3
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.1'
+          extensions: pdo_mysql
+
+      - name: Validate SQL files
+        run: |
+          for file in database/migrations/*.sql; do
+            mysql -h127.0.0.1 -uroot -proot -e "SOURCE $file" 2>&1 | grep -i "error" && exit 1
+          done
+
+      - name: Check migration reversibility
+        run: |
+          for file in database/migrations/*_up.sql; do
+            down_file="${file%_up.sql}_down.sql"
+            if [ ! -f "$down_file" ]; then
+              echo "Missing down migration for $file"
+              exit 1
+            fi
+          done
+
+      - name: Verify schema consistency
+        run: |
+          mysql -h127.0.0.1 -uroot -proot awe_academy_test < database/schema.sql
+          mysqldump -h127.0.0.1 -uroot -proot --no-data awe_academy_test > current_schema.sql
+          diff database/schema.sql current_schema.sql || exit 1
+
+  test:
+    name: Test Migrations
+    needs: validate
+    runs-on: ubuntu-latest
+    
+    services:
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: root
+          MYSQL_DATABASE: awe_academy_test
+        ports:
+          - 3306:3306
+        options: --health-cmd="mysqladmin ping" --health-interval=10s --health-timeout=5s --health-retries=3
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.1'
+          extensions: pdo_mysql
+
+      - name: Run migrations
+        run: |
+          php artisan migrate:fresh --seed --env=testing
+          php artisan migrate:status --env=testing
+
+      - name: Test rollback
+        run: |
+          php artisan migrate:rollback --env=testing
+          php artisan migrate --env=testing
+
+      - name: Verify data integrity
+        run: |
+          php artisan db:seed --class=TestDataSeeder --env=testing
+          php artisan test --filter=DatabaseTest
+
+  backup:
+    name: Database Backup
+    needs: test
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch'
+    environment: ${{ github.event.inputs.environment }}
+    
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Create backup
+        run: |
+          timestamp=$(date +%Y%m%d_%H%M%S)
+          mysqldump -h ${{ secrets.DB_HOST }} \
+                   -u ${{ secrets.DB_USERNAME }} \
+                   -p${{ secrets.DB_PASSWORD }} \
+                   ${{ secrets.DB_DATABASE }} > backup_${timestamp}.sql
+
+      - name: Upload backup to S3
+        run: |
+          aws s3 cp backup_*.sql s3://${{ secrets.BACKUP_BUCKET }}/
+
+  migrate:
+    name: Run Migrations
+    needs: [test, backup]
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch'
+    environment: ${{ github.event.inputs.environment }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.1'
+          extensions: pdo_mysql
+
+      - name: Run migrations
+        run: |
+          php artisan down
+          php artisan migrate --force
+          php artisan cache:clear
+          php artisan config:clear
+          php artisan up
+
+      - name: Verify migration
+        run: |
+          php artisan migrate:status
+          php artisan db:monitor --check-connections
+
+  notify:
+    name: Send Notifications
+    needs: [validate, test, backup, migrate]
+    runs-on: ubuntu-latest
+    if: always()
+    
+    steps:
+      - name: Send Slack notification
+        uses: slackapi/slack-github-action@v1.24.0
+        with:
+          channel-id: 'database-updates'
+          slack-message: |
+            Database management status:
+            - Validation: ${{ needs.validate.result }}
+            - Testing: ${{ needs.test.result }}
+            - Backup: ${{ needs.backup.result }}
+            - Migration: ${{ needs.migrate.result }}
+            
+            Environment: ${{ github.event.inputs.environment || 'N/A' }}
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+
+      - name: Generate report
+        run: |
+          echo "# Database Management Report" > db-report.md
+          echo "## Status" >> db-report.md
+          echo "- Validation: ${{ needs.validate.result }}" >> db-report.md
+          echo "- Testing: ${{ needs.test.result }}" >> db-report.md
+          echo "- Backup: ${{ needs.backup.result }}" >> db-report.md
+          echo "- Migration: ${{ needs.migrate.result }}" >> db-report.md
+          echo "" >> db-report.md
+          echo "## Details" >> db-report.md
+          echo "- Environment: ${{ github.event.inputs.environment || 'N/A' }}" >> db-report.md
+          echo "- Triggered by: ${{ github.actor }}" >> db-report.md
+          echo "- Workflow URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" >> db-report.md
+
+      - name: Upload report
+        uses: actions/upload-artifact@v3
+        with:
+          name: database-report
+          path: db-report.md
