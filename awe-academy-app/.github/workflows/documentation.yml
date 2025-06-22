@@ -1,0 +1,341 @@
+name: Documentation Management
+
+on:
+  push:
+    branches: [ main, develop ]
+    paths:
+      - '**/*.md'
+      - '**/*.rst'
+      - 'docs/**'
+      - '**/docstrings/**'
+      - '**/jsdoc/**'
+      - '**/phpdoc/**'
+  pull_request:
+    paths:
+      - '**/*.md'
+      - '**/*.rst'
+      - 'docs/**'
+      - '**/docstrings/**'
+      - '**/jsdoc/**'
+      - '**/phpdoc/**'
+  workflow_dispatch:
+    inputs:
+      doc_type:
+        description: 'Type of documentation to generate'
+        required: true
+        type: choice
+        options:
+          - all
+          - api
+          - user
+          - developer
+          - deployment
+      version:
+        description: 'Documentation version'
+        required: true
+        default: 'latest'
+        type: string
+
+jobs:
+  prepare:
+    name: Prepare Documentation
+    runs-on: ubuntu-latest
+    
+    outputs:
+      doc_id: ${{ steps.generate.outputs.id }}
+      version: ${{ steps.version.outputs.tag }}
+    
+    steps:
+      - name: Generate documentation ID
+        id: generate
+        run: echo "id=$(date +%Y%m%d_%H%M%S)_$RANDOM" >> $GITHUB_OUTPUT
+
+      - name: Set version tag
+        id: version
+        run: |
+          if [[ "${{ github.event.inputs.version }}" == "latest" ]]; then
+            echo "tag=$(git describe --tags --abbrev=0)" >> $GITHUB_OUTPUT
+          else
+            echo "tag=${{ github.event.inputs.version }}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Checkout code
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.x'
+          cache: 'pip'
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '16'
+          cache: 'npm'
+
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.1'
+          extensions: mbstring, xml
+          coverage: none
+
+      - name: Install dependencies
+        run: |
+          pip install -r docs/requirements.txt
+          npm install -g jsdoc
+          composer require --dev phpdocumentor/phpdocumentor
+
+  api-docs:
+    name: Generate API Documentation
+    needs: prepare
+    runs-on: ubuntu-latest
+    if: github.event.inputs.doc_type == 'all' || github.event.inputs.doc_type == 'api'
+    
+    steps:
+      - name: Generate OpenAPI specs
+        run: |
+          php artisan l5-swagger:generate
+          mv storage/api-docs/api-docs.json docs/api/openapi.json
+
+      - name: Generate API documentation
+        run: |
+          npm install -g redoc-cli
+          redoc-cli bundle docs/api/openapi.json \
+            --output docs/api/index.html \
+            --title "AWE Academy API Documentation" \
+            --template docs/api/template.hbs
+
+      - name: Generate Postman collection
+        run: |
+          npm install -g openapi-to-postmanv2
+          openapi2postmanv2 \
+            -s docs/api/openapi.json \
+            -o docs/api/postman_collection.json \
+            -p
+
+      - name: Upload API documentation
+        uses: actions/upload-artifact@v3
+        with:
+          name: api-documentation
+          path: docs/api/
+
+  user-docs:
+    name: Generate User Documentation
+    needs: prepare
+    runs-on: ubuntu-latest
+    if: github.event.inputs.doc_type == 'all' || github.event.inputs.doc_type == 'user'
+    
+    steps:
+      - name: Generate user documentation
+        run: |
+          cd docs/user
+          mkdocs build
+          
+          # Generate PDF version
+          pip install mkdocs-pdf-export-plugin
+          mkdocs build -f mkdocs-pdf.yml
+
+      - name: Process screenshots
+        run: |
+          cd docs/user/docs/images
+          for file in *.png; do
+            convert "$file" -resize '800x600>' "$file"
+          done
+
+      - name: Upload user documentation
+        uses: actions/upload-artifact@v3
+        with:
+          name: user-documentation
+          path: |
+            docs/user/site/
+            docs/user/pdf/
+
+  developer-docs:
+    name: Generate Developer Documentation
+    needs: prepare
+    runs-on: ubuntu-latest
+    if: github.event.inputs.doc_type == 'all' || github.event.inputs.doc_type == 'developer'
+    
+    steps:
+      - name: Generate PHP documentation
+        run: |
+          vendor/bin/phpdoc \
+            -d app/ \
+            -t docs/developer/php \
+            --template=clean
+
+      - name: Generate JavaScript documentation
+        run: |
+          jsdoc \
+            -c jsdoc.json \
+            -d docs/developer/js \
+            resources/js/
+
+      - name: Generate database documentation
+        run: |
+          php artisan db:document \
+            --format=html,pdf \
+            --output=docs/developer/database
+
+      - name: Generate architecture documentation
+        run: |
+          cd docs/developer
+          sphinx-build -b html source build/html
+          sphinx-build -b pdf source build/pdf
+
+      - name: Upload developer documentation
+        uses: actions/upload-artifact@v3
+        with:
+          name: developer-documentation
+          path: docs/developer/
+
+  deployment-docs:
+    name: Generate Deployment Documentation
+    needs: prepare
+    runs-on: ubuntu-latest
+    if: github.event.inputs.doc_type == 'all' || github.event.inputs.doc_type == 'deployment'
+    
+    steps:
+      - name: Generate deployment guides
+        run: |
+          cd docs/deployment
+          sphinx-build -b html source build/html
+          sphinx-build -b pdf source build/pdf
+
+      - name: Generate infrastructure diagrams
+        run: |
+          npm install -g @mermaid-js/mermaid-cli
+          
+          for file in docs/deployment/diagrams/*.mmd; do
+            mmdc -i "$file" -o "${file%.mmd}.png"
+          done
+
+      - name: Upload deployment documentation
+        uses: actions/upload-artifact@v3
+        with:
+          name: deployment-documentation
+          path: docs/deployment/
+
+  publish:
+    name: Publish Documentation
+    needs: [prepare, api-docs, user-docs, developer-docs, deployment-docs]
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    
+    steps:
+      - name: Download all documentation
+        uses: actions/download-artifact@v3
+
+      - name: Prepare documentation site
+        run: |
+          mkdir -p public
+          
+          # Copy documentation
+          cp -r api-documentation/* public/api/
+          cp -r user-documentation/* public/user/
+          cp -r developer-documentation/* public/developer/
+          cp -r deployment-documentation/* public/deployment/
+          
+          # Generate index page
+          cat > public/index.html <<EOF
+          <!DOCTYPE html>
+          <html>
+          <head>
+            <title>AWE Academy Documentation</title>
+            <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@1/css/pico.min.css">
+          </head>
+          <body>
+            <main class="container">
+              <h1>AWE Academy Documentation</h1>
+              <p>Version: ${{ needs.prepare.outputs.version }}</p>
+              <nav>
+                <ul>
+                  <li><a href="/api/">API Documentation</a></li>
+                  <li><a href="/user/">User Guide</a></li>
+                  <li><a href="/developer/">Developer Guide</a></li>
+                  <li><a href="/deployment/">Deployment Guide</a></li>
+                </ul>
+              </nav>
+            </main>
+          </body>
+          </html>
+          EOF
+
+      - name: Deploy to GitHub Pages
+        uses: peaceiris/actions-gh-pages@v3
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./public
+          user_name: 'github-actions[bot]'
+          user_email: 'github-actions[bot]@users.noreply.github.com'
+          commit_message: 'docs: update documentation (${{ needs.prepare.outputs.doc_id }})'
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Deploy to S3
+        run: |
+          aws s3 sync \
+            public/ \
+            s3://${{ secrets.DOCS_BUCKET }}/${{ needs.prepare.outputs.version }}/ \
+            --delete
+
+      - name: Invalidate CloudFront cache
+        run: |
+          aws cloudfront create-invalidation \
+            --distribution-id ${{ secrets.DOCS_DISTRIBUTION_ID }} \
+            --paths "/*"
+
+  notify:
+    name: Send Notifications
+    needs: [prepare, publish]
+    runs-on: ubuntu-latest
+    if: always()
+    
+    steps:
+      - name: Send Slack notification
+        uses: slackapi/slack-github-action@v1.24.0
+        with:
+          channel-id: 'documentation'
+          slack-message: |
+            :books: Documentation Update
+            
+            ID: ${{ needs.prepare.outputs.doc_id }}
+            Version: ${{ needs.prepare.outputs.version }}
+            
+            Status:
+            - API Docs: ${{ needs.api-docs.result }}
+            - User Docs: ${{ needs.user-docs.result }}
+            - Developer Docs: ${{ needs.developer-docs.result }}
+            - Deployment Docs: ${{ needs.deployment-docs.result }}
+            
+            View documentation: https://docs.aweacademy.com/
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+
+      - name: Send email notification
+        if: failure()
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: ${{ secrets.SMTP_SERVER }}
+          server_port: ${{ secrets.SMTP_PORT }}
+          username: ${{ secrets.SMTP_USERNAME }}
+          password: ${{ secrets.SMTP_PASSWORD }}
+          subject: "Documentation Update Failed"
+          body: |
+            Documentation update process has failed.
+            
+            ID: ${{ needs.prepare.outputs.doc_id }}
+            Version: ${{ needs.prepare.outputs.version }}
+            
+            Check the logs: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          to: docs@aweacademy.com
+          from: AWE Academy Docs <docs@aweacademy.com>
