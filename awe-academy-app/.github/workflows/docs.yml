@@ -1,0 +1,184 @@
+name: Documentation
+
+on:
+  push:
+    branches: [ main, develop ]
+    paths:
+      - 'docs/**'
+      - '**/*.md'
+      - '**/*.mdx'
+      - '**/docusaurus.config.js'
+      - '**/sidebars.js'
+  pull_request:
+    branches: [ main, develop ]
+    paths:
+      - 'docs/**'
+      - '**/*.md'
+      - '**/*.mdx'
+      - '**/docusaurus.config.js'
+      - '**/sidebars.js'
+  workflow_dispatch:
+
+jobs:
+  validate:
+    name: Validate Documentation
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '16'
+          cache: 'npm'
+
+      - name: Check markdown links
+        uses: gaurav-nelson/github-action-markdown-link-check@v1
+        with:
+          use-quiet-mode: 'yes'
+          use-verbose-mode: 'yes'
+          config-file: '.github/workflows/mlc_config.json'
+          folder-path: 'docs'
+          max-depth: -1
+
+      - name: Check markdown formatting
+        uses: DavidAnson/markdownlint-cli2-action@v9
+        with:
+          globs: |
+            docs/**/*.md
+            **/*.mdx
+            *.md
+
+      - name: Spell check
+        uses: streetsidesoftware/cspell-action@v2
+        with:
+          files: |
+            docs/**/*.md
+            **/*.mdx
+            *.md
+          config: .cspell.json
+
+  build:
+    name: Build Documentation
+    needs: validate
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '16'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: |
+          cd docs
+          npm ci
+
+      - name: Generate API documentation
+        run: |
+          composer install --no-dev --optimize-autoloader
+          ./vendor/bin/phpDocumentor -d src,modules -t docs/api
+
+      - name: Build documentation
+        run: |
+          cd docs
+          npm run build
+
+      - name: Upload documentation artifact
+        uses: actions/upload-artifact@v3
+        with:
+          name: documentation
+          path: docs/build
+
+  deploy:
+    name: Deploy Documentation
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    environment: docs
+    
+    steps:
+      - name: Download documentation artifact
+        uses: actions/download-artifact@v3
+        with:
+          name: documentation
+          path: docs/build
+
+      - name: Deploy to GitHub Pages
+        uses: peaceiris/actions-gh-pages@v3
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: docs/build
+          cname: docs.aweacademy.com
+
+  algolia:
+    name: Update Search Index
+    needs: deploy
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    
+    steps:
+      - name: Push indices to Algolia
+        uses: algolia/algoliasearch-crawler-github-actions@v1
+        with:
+          crawler-user-id: ${{ secrets.ALGOLIA_CRAWLER_USER_ID }}
+          crawler-api-key: ${{ secrets.ALGOLIA_CRAWLER_API_KEY }}
+          algolia-app-id: ${{ secrets.ALGOLIA_APP_ID }}
+          algolia-api-key: ${{ secrets.ALGOLIA_API_KEY }}
+          site-url: 'https://docs.aweacademy.com'
+
+  notify:
+    name: Send Notifications
+    needs: [deploy, algolia]
+    runs-on: ubuntu-latest
+    if: always()
+    
+    steps:
+      - name: Send Slack notification
+        uses: slackapi/slack-github-action@v1.24.0
+        if: always()
+        with:
+          channel-id: 'docs-updates'
+          slack-message: |
+            Documentation update status:
+            - Validation: ${{ needs.validate.result }}
+            - Build: ${{ needs.build.result }}
+            - Deploy: ${{ needs.deploy.result }}
+            - Search Index: ${{ needs.algolia.result }}
+            
+            View the docs: https://docs.aweacademy.com
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+
+  report:
+    name: Generate Documentation Report
+    needs: [validate, build, deploy, algolia]
+    runs-on: ubuntu-latest
+    if: always()
+    
+    steps:
+      - name: Generate report
+        run: |
+          echo "# Documentation Update Report" > docs-report.md
+          echo "## Status" >> docs-report.md
+          echo "- Validation: ${{ needs.validate.result }}" >> docs-report.md
+          echo "- Build: ${{ needs.build.result }}" >> docs-report.md
+          echo "- Deploy: ${{ needs.deploy.result }}" >> docs-report.md
+          echo "- Search Index: ${{ needs.algolia.result }}" >> docs-report.md
+          echo "" >> docs-report.md
+          echo "## Details" >> docs-report.md
+          echo "- Documentation URL: https://docs.aweacademy.com" >> docs-report.md
+          echo "- Build URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" >> docs-report.md
+          echo "- Commit: ${{ github.sha }}" >> docs-report.md
+
+      - name: Upload report
+        uses: actions/upload-artifact@v3
+        with:
+          name: docs-report
+          path: docs-report.md
