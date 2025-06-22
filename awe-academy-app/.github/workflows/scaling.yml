@@ -1,0 +1,350 @@
+name: Scaling Management
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'  # Run every 5 minutes
+  workflow_dispatch:
+    inputs:
+      scaling_action:
+        description: 'Scaling action to perform'
+        required: true
+        type: choice
+        options:
+          - auto
+          - up
+          - down
+          - optimize
+      service_type:
+        description: 'Service to scale'
+        required: true
+        type: choice
+        options:
+          - all
+          - web
+          - api
+          - database
+          - cache
+      scaling_factor:
+        description: 'Scaling factor (percentage)'
+        required: true
+        default: '20'
+        type: string
+
+jobs:
+  analyze:
+    name: Analyze System Metrics
+    runs-on: ubuntu-latest
+    
+    outputs:
+      scaling_id: ${{ steps.generate.outputs.id }}
+      cpu_threshold: ${{ steps.metrics.outputs.cpu }}
+      memory_threshold: ${{ steps.metrics.outputs.memory }}
+      load_threshold: ${{ steps.metrics.outputs.load }}
+    
+    steps:
+      - name: Generate scaling ID
+        id: generate
+        run: echo "id=$(date +%Y%m%d_%H%M%S)_$RANDOM" >> $GITHUB_OUTPUT
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Get system metrics
+        id: metrics
+        run: |
+          # Get CPU utilization
+          cpu=$(aws cloudwatch get-metric-statistics \
+            --namespace AWS/ECS \
+            --metric-name CPUUtilization \
+            --dimensions Name=ClusterName,Value=aweacademy \
+            --start-time $(date -u -d '5 minutes ago' +%Y-%m-%dT%H:%M:%SZ) \
+            --end-time $(date -u +%Y-%m-%dT%H:%M:%SZ) \
+            --period 300 \
+            --statistics Average \
+            --query 'Datapoints[0].Average' \
+            --output text)
+          echo "cpu=$cpu" >> $GITHUB_OUTPUT
+          
+          # Get memory utilization
+          memory=$(aws cloudwatch get-metric-statistics \
+            --namespace AWS/ECS \
+            --metric-name MemoryUtilization \
+            --dimensions Name=ClusterName,Value=aweacademy \
+            --start-time $(date -u -d '5 minutes ago' +%Y-%m-%dT%H:%M:%SZ) \
+            --end-time $(date -u +%Y-%m-%dT%H:%M:%SZ) \
+            --period 300 \
+            --statistics Average \
+            --query 'Datapoints[0].Average' \
+            --output text)
+          echo "memory=$memory" >> $GITHUB_OUTPUT
+          
+          # Get system load
+          load=$(aws cloudwatch get-metric-statistics \
+            --namespace AWS/ECS \
+            --metric-name LoadAverage \
+            --dimensions Name=ClusterName,Value=aweacademy \
+            --start-time $(date -u -d '5 minutes ago' +%Y-%m-%dT%H:%M:%SZ) \
+            --end-time $(date -u +%Y-%m-%dT%H:%M:%SZ) \
+            --period 300 \
+            --statistics Average \
+            --query 'Datapoints[0].Average' \
+            --output text)
+          echo "load=$load" >> $GITHUB_OUTPUT
+
+  web-scaling:
+    name: Web Service Scaling
+    needs: analyze
+    runs-on: ubuntu-latest
+    if: github.event.inputs.service_type == 'all' || github.event.inputs.service_type == 'web'
+    
+    steps:
+      - name: Check scaling conditions
+        id: check
+        run: |
+          if [[ "${{ github.event.inputs.scaling_action }}" == "up" ]] || \
+             [[ "${{ github.event.inputs.scaling_action }}" == "auto" && \
+                (${{ needs.analyze.outputs.cpu_threshold }} > 70 || \
+                 ${{ needs.analyze.outputs.memory_threshold }} > 80) ]]; then
+            echo "action=scale_up" >> $GITHUB_OUTPUT
+          elif [[ "${{ github.event.inputs.scaling_action }}" == "down" ]] || \
+               [[ "${{ github.event.inputs.scaling_action }}" == "auto" && \
+                  ${{ needs.analyze.outputs.cpu_threshold }} < 30 && \
+                  ${{ needs.analyze.outputs.memory_threshold }} < 40 ]]; then
+            echo "action=scale_down" >> $GITHUB_OUTPUT
+          else
+            echo "action=none" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Scale web service
+        if: steps.check.outputs.action != 'none'
+        run: |
+          current_count=$(aws ecs describe-services \
+            --cluster aweacademy \
+            --services web \
+            --query 'services[0].desiredCount' \
+            --output text)
+          
+          if [[ "${{ steps.check.outputs.action }}" == "scale_up" ]]; then
+            new_count=$((current_count + current_count * ${{ github.event.inputs.scaling_factor }} / 100))
+          else
+            new_count=$((current_count - current_count * ${{ github.event.inputs.scaling_factor }} / 100))
+          fi
+          
+          aws ecs update-service \
+            --cluster aweacademy \
+            --service web \
+            --desired-count $new_count
+
+  api-scaling:
+    name: API Service Scaling
+    needs: analyze
+    runs-on: ubuntu-latest
+    if: github.event.inputs.service_type == 'all' || github.event.inputs.service_type == 'api'
+    
+    steps:
+      - name: Check scaling conditions
+        id: check
+        run: |
+          if [[ "${{ github.event.inputs.scaling_action }}" == "up" ]] || \
+             [[ "${{ github.event.inputs.scaling_action }}" == "auto" && \
+                ${{ needs.analyze.outputs.load_threshold }} > 2 ]]; then
+            echo "action=scale_up" >> $GITHUB_OUTPUT
+          elif [[ "${{ github.event.inputs.scaling_action }}" == "down" ]] || \
+               [[ "${{ github.event.inputs.scaling_action }}" == "auto" && \
+                  ${{ needs.analyze.outputs.load_threshold }} < 0.5 ]]; then
+            echo "action=scale_down" >> $GITHUB_OUTPUT
+          else
+            echo "action=none" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Scale API service
+        if: steps.check.outputs.action != 'none'
+        run: |
+          current_count=$(aws ecs describe-services \
+            --cluster aweacademy \
+            --services api \
+            --query 'services[0].desiredCount' \
+            --output text)
+          
+          if [[ "${{ steps.check.outputs.action }}" == "scale_up" ]]; then
+            new_count=$((current_count + current_count * ${{ github.event.inputs.scaling_factor }} / 100))
+          else
+            new_count=$((current_count - current_count * ${{ github.event.inputs.scaling_factor }} / 100))
+          fi
+          
+          aws ecs update-service \
+            --cluster aweacademy \
+            --service api \
+            --desired-count $new_count
+
+  database-scaling:
+    name: Database Scaling
+    needs: analyze
+    runs-on: ubuntu-latest
+    if: github.event.inputs.service_type == 'all' || github.event.inputs.service_type == 'database'
+    
+    steps:
+      - name: Check scaling conditions
+        id: check
+        run: |
+          if [[ "${{ github.event.inputs.scaling_action }}" == "up" ]] || \
+             [[ "${{ github.event.inputs.scaling_action }}" == "auto" && \
+                ${{ needs.analyze.outputs.cpu_threshold }} > 60 ]]; then
+            echo "action=scale_up" >> $GITHUB_OUTPUT
+          elif [[ "${{ github.event.inputs.scaling_action }}" == "down" ]] || \
+               [[ "${{ github.event.inputs.scaling_action }}" == "auto" && \
+                  ${{ needs.analyze.outputs.cpu_threshold }} < 20 ]]; then
+            echo "action=scale_down" >> $GITHUB_OUTPUT
+          else
+            echo "action=none" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Scale database
+        if: steps.check.outputs.action != 'none'
+        run: |
+          current_class=$(aws rds describe-db-instances \
+            --db-instance-identifier aweacademy \
+            --query 'DBInstances[0].DBInstanceClass' \
+            --output text)
+          
+          if [[ "${{ steps.check.outputs.action }}" == "scale_up" ]]; then
+            new_class=$(echo $current_class | awk -F. '{print $1"."$2*2}')
+          else
+            new_class=$(echo $current_class | awk -F. '{print $1"."$2/2}')
+          fi
+          
+          aws rds modify-db-instance \
+            --db-instance-identifier aweacademy \
+            --db-instance-class $new_class \
+            --apply-immediately
+
+  cache-scaling:
+    name: Cache Scaling
+    needs: analyze
+    runs-on: ubuntu-latest
+    if: github.event.inputs.service_type == 'all' || github.event.inputs.service_type == 'cache'
+    
+    steps:
+      - name: Check scaling conditions
+        id: check
+        run: |
+          if [[ "${{ github.event.inputs.scaling_action }}" == "up" ]] || \
+             [[ "${{ github.event.inputs.scaling_action }}" == "auto" && \
+                ${{ needs.analyze.outputs.memory_threshold }} > 70 ]]; then
+            echo "action=scale_up" >> $GITHUB_OUTPUT
+          elif [[ "${{ github.event.inputs.scaling_action }}" == "down" ]] || \
+               [[ "${{ github.event.inputs.scaling_action }}" == "auto" && \
+                  ${{ needs.analyze.outputs.memory_threshold }} < 30 ]]; then
+            echo "action=scale_down" >> $GITHUB_OUTPUT
+          else
+            echo "action=none" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Scale cache
+        if: steps.check.outputs.action != 'none'
+        run: |
+          current_type=$(aws elasticache describe-cache-clusters \
+            --cache-cluster-id aweacademy \
+            --query 'CacheClusters[0].CacheNodeType' \
+            --output text)
+          
+          if [[ "${{ steps.check.outputs.action }}" == "scale_up" ]]; then
+            new_type=$(echo $current_type | awk -F. '{print $1"."$2*2}')
+          else
+            new_type=$(echo $current_type | awk -F. '{print $1"."$2/2}')
+          fi
+          
+          aws elasticache modify-cache-cluster \
+            --cache-cluster-id aweacademy \
+            --cache-node-type $new_type \
+            --apply-immediately
+
+  report:
+    name: Generate Scaling Report
+    needs: [analyze, web-scaling, api-scaling, database-scaling, cache-scaling]
+    runs-on: ubuntu-latest
+    if: always()
+    
+    steps:
+      - name: Generate scaling report
+        run: |
+          echo "# Scaling Report" > scaling-report.md
+          echo "## Scaling ID: ${{ needs.analyze.outputs.scaling_id }}" >> scaling-report.md
+          echo "## Action: ${{ github.event.inputs.scaling_action || 'auto' }}" >> scaling-report.md
+          
+          echo "## System Metrics" >> scaling-report.md
+          echo "- CPU Utilization: ${{ needs.analyze.outputs.cpu_threshold }}%" >> scaling-report.md
+          echo "- Memory Utilization: ${{ needs.analyze.outputs.memory_threshold }}%" >> scaling-report.md
+          echo "- System Load: ${{ needs.analyze.outputs.load_threshold }}" >> scaling-report.md
+          
+          echo "## Scaling Results" >> scaling-report.md
+          echo "- Web Service: ${{ needs.web-scaling.result }}" >> scaling-report.md
+          echo "- API Service: ${{ needs.api-scaling.result }}" >> scaling-report.md
+          echo "- Database: ${{ needs.database-scaling.result }}" >> scaling-report.md
+          echo "- Cache: ${{ needs.cache-scaling.result }}" >> scaling-report.md
+
+      - name: Upload scaling report
+        uses: actions/upload-artifact@v3
+        with:
+          name: scaling-report
+          path: scaling-report.md
+
+  notify:
+    name: Send Notifications
+    needs: [analyze, report]
+    runs-on: ubuntu-latest
+    if: always()
+    
+    steps:
+      - name: Download scaling report
+        uses: actions/download-artifact@v3
+        with:
+          name: scaling-report
+
+      - name: Send Slack notification
+        uses: slackapi/slack-github-action@v1.24.0
+        with:
+          channel-id: 'scaling'
+          slack-message: |
+            :arrows_vertical: Scaling Operation Complete
+            
+            Scaling ID: ${{ needs.analyze.outputs.scaling_id }}
+            Action: ${{ github.event.inputs.scaling_action || 'auto' }}
+            
+            Metrics:
+            - CPU: ${{ needs.analyze.outputs.cpu_threshold }}%
+            - Memory: ${{ needs.analyze.outputs.memory_threshold }}%
+            - Load: ${{ needs.analyze.outputs.load_threshold }}
+            
+            Status:
+            - Web: ${{ needs.web-scaling.result }}
+            - API: ${{ needs.api-scaling.result }}
+            - DB: ${{ needs.database-scaling.result }}
+            - Cache: ${{ needs.cache-scaling.result }}
+            
+            View detailed report: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+
+      - name: Send email notification
+        if: failure()
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: ${{ secrets.SMTP_SERVER }}
+          server_port: ${{ secrets.SMTP_PORT }}
+          username: ${{ secrets.SMTP_USERNAME }}
+          password: ${{ secrets.SMTP_PASSWORD }}
+          subject: "Scaling Operation Failed"
+          body: |
+            Scaling operation has failed.
+            
+            Scaling ID: ${{ needs.analyze.outputs.scaling_id }}
+            Action: ${{ github.event.inputs.scaling_action || 'auto' }}
+            
+            Check the detailed report: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          to: ops@aweacademy.com
+          from: AWE Academy Scaling <scaling@aweacademy.com>
