@@ -1,0 +1,166 @@
+name: Release Management
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+jobs:
+  validate:
+    name: Validate Release
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+
+      - name: Validate tag format
+        run: |
+          if [[ ! ${{ github.ref }} =~ ^refs/tags/v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Invalid tag format. Must be v*.*.* (e.g., v1.2.3)"
+            exit 1
+          fi
+
+      - name: Check CHANGELOG
+        run: |
+          version=$(echo ${{ github.ref }} | sed 's/refs\/tags\/v//')
+          if ! grep -q "## \[$version\]" CHANGELOG.md; then
+            echo "Version $version not found in CHANGELOG.md"
+            exit 1
+          fi
+
+  build:
+    name: Build Release
+    needs: validate
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.1'
+          extensions: mbstring, intl, gd, xml, zip, pdo_mysql
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '16'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: |
+          composer install --no-dev --optimize-autoloader
+          npm ci
+          npm run production
+
+      - name: Create release archive
+        run: |
+          version=$(echo ${{ github.ref }} | sed 's/refs\/tags\/v//')
+          zip -r "awe-academy-v${version}.zip" . \
+            -x "*.git*" \
+            -x "node_modules/*" \
+            -x "tests/*" \
+            -x "*.env*" \
+            -x "storage/logs/*" \
+            -x "storage/cache/*"
+
+      - name: Generate checksums
+        run: |
+          version=$(echo ${{ github.ref }} | sed 's/refs\/tags\/v//')
+          sha256sum "awe-academy-v${version}.zip" > "awe-academy-v${version}.sha256"
+          md5sum "awe-academy-v${version}.zip" > "awe-academy-v${version}.md5"
+
+  release:
+    name: Create Release
+    needs: build
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Get version
+        id: get_version
+        run: echo "VERSION=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
+
+      - name: Get changelog entry
+        id: get_changelog
+        run: |
+          version=${{ steps.get_version.outputs.VERSION }}
+          changelog=$(awk "/## \[$version\]/,/## \[/" CHANGELOG.md | head -n -1)
+          echo "CHANGELOG<<EOF" >> $GITHUB_OUTPUT
+          echo "$changelog" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v1
+        with:
+          name: Release ${{ steps.get_version.outputs.VERSION }}
+          body: ${{ steps.get_changelog.outputs.CHANGELOG }}
+          draft: false
+          prerelease: false
+          files: |
+            awe-academy-v${{ steps.get_version.outputs.VERSION }}.zip
+            awe-academy-v${{ steps.get_version.outputs.VERSION }}.sha256
+            awe-academy-v${{ steps.get_version.outputs.VERSION }}.md5
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  notify:
+    name: Send Notifications
+    needs: release
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Send Slack notification
+        uses: slackapi/slack-github-action@v1.24.0
+        with:
+          channel-id: 'releases'
+          slack-message: |
+            :rocket: New release published: ${{ github.ref_name }}
+            
+            Check it out: ${{ github.server_url }}/${{ github.repository }}/releases/tag/${{ github.ref_name }}
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+
+      - name: Send email notification
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: ${{ secrets.SMTP_SERVER }}
+          server_port: ${{ secrets.SMTP_PORT }}
+          username: ${{ secrets.SMTP_USERNAME }}
+          password: ${{ secrets.SMTP_PASSWORD }}
+          subject: "New Release: AWE Academy v${{ github.ref_name }}"
+          body: |
+            A new version of AWE Academy has been released!
+            
+            Version: ${{ github.ref_name }}
+            Release URL: ${{ github.server_url }}/${{ github.repository }}/releases/tag/${{ github.ref_name }}
+            
+            Please review the changelog for details about the changes.
+          to: team@aweacademy.com
+          from: AWE Academy Release Bot <releases@aweacademy.com>
+
+  deploy:
+    name: Deploy Release
+    needs: release
+    runs-on: ubuntu-latest
+    environment: production
+    
+    steps:
+      - name: Configure SSH
+        run: |
+          mkdir -p ~/.ssh/
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          ssh-keyscan -H ${{ secrets.PRODUCTION_HOST }} >> ~/.ssh/known_hosts
+
+      - name: Deploy to production
+        run: |
+          version=$(echo ${{ github.ref }} | sed 's/refs\/tags\/v//')
+          scp "awe-academy-v${version}.zip" ${{ secrets.PRODUCTION_USER }}@${{ secrets.PRODUCTION_HOST }}:~/releases/
+          ssh ${{ secrets.PRODUCTION_USER }}@${{ secrets.PRODUCTION_HOST }} "cd ~/releases && \
+            unzip -o awe-academy-v${version}.zip && \
+            ./deploy.sh"
