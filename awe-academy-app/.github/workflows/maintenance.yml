@@ -1,0 +1,227 @@
+name: System Maintenance
+
+on:
+  schedule:
+    - cron: '0 3 * * 0'  # Run weekly on Sundays at 3 AM UTC
+  workflow_dispatch:
+    inputs:
+      maintenance_type:
+        description: 'Type of maintenance to perform'
+        required: true
+        default: 'full'
+        type: choice
+        options:
+          - full
+          - cache
+          - logs
+          - temp
+          - database
+
+jobs:
+  prepare:
+    name: Prepare Maintenance
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Create maintenance window
+        run: |
+          echo "MAINTENANCE_ID=$(date +%Y%m%d_%H%M%S)" >> $GITHUB_ENV
+          echo "Starting maintenance window $MAINTENANCE_ID"
+
+      - name: Notify start
+        uses: slackapi/slack-github-action@v1.24.0
+        with:
+          channel-id: 'system-maintenance'
+          slack-message: |
+            :warning: Starting system maintenance
+            ID: ${{ env.MAINTENANCE_ID }}
+            Type: ${{ github.event.inputs.maintenance_type || 'full' }}
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+
+  cache-cleanup:
+    name: Cache Cleanup
+    needs: prepare
+    runs-on: ubuntu-latest
+    if: github.event.inputs.maintenance_type == 'full' || github.event.inputs.maintenance_type == 'cache'
+    
+    steps:
+      - name: Configure SSH
+        run: |
+          mkdir -p ~/.ssh/
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          ssh-keyscan -H ${{ secrets.DEPLOY_HOST }} >> ~/.ssh/known_hosts
+
+      - name: Clear application cache
+        run: |
+          ssh ${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }} "
+            cd /var/www/aweacademy && \
+            php artisan cache:clear && \
+            php artisan view:clear && \
+            php artisan route:clear && \
+            php artisan config:clear && \
+            redis-cli flushall"
+
+      - name: Clear CDN cache
+        run: |
+          curl -X PURGE "${{ secrets.CDN_PURGE_URL }}" \
+            -H "Authorization: Bearer ${{ secrets.CDN_API_KEY }}"
+
+  log-cleanup:
+    name: Log Cleanup
+    needs: prepare
+    runs-on: ubuntu-latest
+    if: github.event.inputs.maintenance_type == 'full' || github.event.inputs.maintenance_type == 'logs'
+    
+    steps:
+      - name: Configure SSH
+        run: |
+          mkdir -p ~/.ssh/
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          ssh-keyscan -H ${{ secrets.DEPLOY_HOST }} >> ~/.ssh/known_hosts
+
+      - name: Archive old logs
+        run: |
+          ssh ${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }} "
+            cd /var/www/aweacademy/storage/logs && \
+            find . -name '*.log' -mtime +30 -exec gzip {} \;"
+
+      - name: Upload logs to S3
+        run: |
+          ssh ${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }} "
+            cd /var/www/aweacademy/storage/logs && \
+            aws s3 sync . s3://${{ secrets.LOG_BUCKET }}/logs/${{ env.MAINTENANCE_ID }}/ \
+              --exclude '*' --include '*.gz'"
+
+      - name: Clear old logs
+        run: |
+          ssh ${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }} "
+            cd /var/www/aweacademy/storage/logs && \
+            find . -name '*.gz' -mtime +30 -delete"
+
+  temp-cleanup:
+    name: Temporary Files Cleanup
+    needs: prepare
+    runs-on: ubuntu-latest
+    if: github.event.inputs.maintenance_type == 'full' || github.event.inputs.maintenance_type == 'temp'
+    
+    steps:
+      - name: Configure SSH
+        run: |
+          mkdir -p ~/.ssh/
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          ssh-keyscan -H ${{ secrets.DEPLOY_HOST }} >> ~/.ssh/known_hosts
+
+      - name: Clear temporary files
+        run: |
+          ssh ${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }} "
+            cd /var/www/aweacademy && \
+            find storage/temp -type f -mtime +7 -delete && \
+            find storage/framework/sessions -type f -mtime +7 -delete && \
+            find storage/framework/views -type f -mtime +7 -delete"
+
+      - name: Clear uploaded temp files
+        run: |
+          ssh ${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }} "
+            cd /var/www/aweacademy/storage/app/public/temp && \
+            find . -type f -mtime +1 -delete"
+
+  database-maintenance:
+    name: Database Maintenance
+    needs: prepare
+    runs-on: ubuntu-latest
+    if: github.event.inputs.maintenance_type == 'full' || github.event.inputs.maintenance_type == 'database'
+    
+    steps:
+      - name: Optimize database
+        run: |
+          mysql \
+            -h ${{ secrets.DB_HOST }} \
+            -u ${{ secrets.DB_USERNAME }} \
+            -p${{ secrets.DB_PASSWORD }} \
+            -e "OPTIMIZE TABLE $(mysql -N -B -h ${{ secrets.DB_HOST }} -u ${{ secrets.DB_USERNAME }} -p${{ secrets.DB_PASSWORD }} ${{ secrets.DB_DATABASE }} -e 'SHOW TABLES' | tr '\n' ',' | sed 's/,$//')"
+
+      - name: Analyze tables
+        run: |
+          mysql \
+            -h ${{ secrets.DB_HOST }} \
+            -u ${{ secrets.DB_USERNAME }} \
+            -p${{ secrets.DB_PASSWORD }} \
+            -e "ANALYZE TABLE $(mysql -N -B -h ${{ secrets.DB_HOST }} -u ${{ secrets.DB_USERNAME }} -p${{ secrets.DB_PASSWORD }} ${{ secrets.DB_DATABASE }} -e 'SHOW TABLES' | tr '\n' ',' | sed 's/,$//')"
+
+      - name: Clear old sessions
+        run: |
+          mysql \
+            -h ${{ secrets.DB_HOST }} \
+            -u ${{ secrets.DB_USERNAME }} \
+            -p${{ secrets.DB_PASSWORD }} \
+            ${{ secrets.DB_DATABASE }} \
+            -e "DELETE FROM sessions WHERE last_activity < DATE_SUB(NOW(), INTERVAL 7 DAY)"
+
+  verify:
+    name: Verify System State
+    needs: [cache-cleanup, log-cleanup, temp-cleanup, database-maintenance]
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Check system health
+        run: |
+          response=$(curl -s -o /dev/null -w "%{http_code}" https://aweacademy.com/health)
+          if [ "$response" != "200" ]; then
+            echo "System health check failed with status $response"
+            exit 1
+          fi
+
+      - name: Check database connection
+        run: |
+          mysql \
+            -h ${{ secrets.DB_HOST }} \
+            -u ${{ secrets.DB_USERNAME }} \
+            -p${{ secrets.DB_PASSWORD }} \
+            -e "SELECT 1"
+
+      - name: Check cache service
+        run: |
+          ssh ${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }} "
+            redis-cli ping"
+
+  report:
+    name: Generate Maintenance Report
+    needs: [prepare, cache-cleanup, log-cleanup, temp-cleanup, database-maintenance, verify]
+    runs-on: ubuntu-latest
+    if: always()
+    
+    steps:
+      - name: Generate report
+        run: |
+          echo "# System Maintenance Report" > maintenance-report.md
+          echo "## Maintenance ID: ${{ env.MAINTENANCE_ID }}" >> maintenance-report.md
+          echo "## Status" >> maintenance-report.md
+          echo "- Cache Cleanup: ${{ needs.cache-cleanup.result }}" >> maintenance-report.md
+          echo "- Log Cleanup: ${{ needs.log-cleanup.result }}" >> maintenance-report.md
+          echo "- Temp Cleanup: ${{ needs.temp-cleanup.result }}" >> maintenance-report.md
+          echo "- Database Maintenance: ${{ needs.database-maintenance.result }}" >> maintenance-report.md
+          echo "- System Verification: ${{ needs.verify.result }}" >> maintenance-report.md
+
+      - name: Upload report
+        uses: actions/upload-artifact@v3
+        with:
+          name: maintenance-report
+          path: maintenance-report.md
+
+      - name: Send notification
+        uses: slackapi/slack-github-action@v1.24.0
+        with:
+          channel-id: 'system-maintenance'
+          slack-message: |
+            :broom: System maintenance completed
+            
+            ID: ${{ env.MAINTENANCE_ID }}
+            Status: ${{ needs.verify.result == 'success' && ':white_check_mark: Success' || ':x: Failed' }}
+            
+            Details: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
