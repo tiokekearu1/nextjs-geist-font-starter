@@ -1,0 +1,139 @@
+{
+  "name": "awe-academy-app",
+  "version": "1.0.0",
+  "description": "Frontend assets for AWE Academy Management System",
+  "private": true,
+  "scripts": {
+    "dev": "npm run development",
+    "development": "mix",
+    "watch": "mix watch",
+    "watch-poll": "mix watch -- --watch-options-poll=1000",
+    "hot": "mix watch --hot",
+    "prod": "npm run production",
+    "production": "mix --production",
+    "lint": "eslint resources/js/**/*.{js,vue}",
+    "lint:fix": "eslint resources/js/**/*.{js,vue} --fix",
+    "format": "prettier --write 'resources/**/*.{css,js,vue}'",
+    "test": "jest"
+  },
+  "dependencies": {
+    "@fortawesome/fontawesome-free": "^6.4.0",
+    "@popperjs/core": "^2.11.8",
+    "bootstrap": "^5.3.0",
+    "chart.js": "^4.3.0",
+    "datatables.net-bs5": "^1.13.5",
+    "datatables.net-buttons-bs5": "^2.4.1",
+    "flatpickr": "^4.6.13",
+    "jquery": "^3.7.0",
+    "moment": "^2.29.4",
+    "select2": "^4.1.0-rc.0",
+    "sweetalert2": "^11.7.12",
+    "tippy.js": "^6.3.7"
+  },
+  "devDependencies": {
+    "@babel/core": "^7.22.5",
+    "@babel/preset-env": "^7.22.5",
+    "@prettier/plugin-php": "^0.19.6",
+    "autoprefixer": "^10.4.14",
+    "babel-loader": "^9.1.2",
+    "browser-sync": "^2.29.3",
+    "browser-sync-webpack-plugin": "^2.3.0",
+    "css-loader": "^6.8.1",
+    "eslint": "^8.42.0",
+    "eslint-config-prettier": "^8.8.0",
+    "eslint-plugin-prettier": "^4.2.1",
+    "jest": "^29.5.0",
+    "laravel-mix": "^6.0.49",
+    "mini-css-extract-plugin": "^2.7.6",
+    "postcss": "^8.4.24",
+    "postcss-loader": "^7.3.3",
+    "prettier": "^2.8.8",
+    "sass": "^1.63.4",
+    "sass-loader": "^13.3.2",
+    "style-loader": "^3.3.3",
+    "webpack": "^5.86.0",
+    "webpack-cli": "^5.1.4"
+  },
+  "browserslist": [
+    ">= 1%",
+    "last 2 versions",
+    "not dead",
+    "Chrome >= 60",
+    "Firefox >= 60",
+    "Edge >= 15.15063",
+    "Explorer 11",
+    "iOS >= 10",
+    "Safari >= 10",
+    "Android >= 6"
+  ],
+  "engines": {
+    "node": ">=14.0.0",
+    "npm": ">=6.0.0"
+  },
+  "jest": {
+    "testEnvironment": "jsdom",
+    "roots": [
+      "<rootDir>/resources/js/tests"
+    ],
+    "moduleNameMapper": {
+      "^@/(.*)$": "<rootDir>/resources/js/$1"
+    },
+    "transform": {
+      "^.+\\.js$": "babel-jest"
+    },
+    "setupFiles": [
+      "<rootDir>/resources/js/tests/setup.js"
+    ],
+    "collectCoverage": true,
+    "collectCoverageFrom": [
+      "resources/js/**/*.{js,vue}",
+      "!resources/js/tests/**"
+    ]
+  },
+  "prettier": {
+    "singleQuote": true,
+    "trailingComma": "es5",
+    "tabWidth": 2,
+    "semi": true,
+    "printWidth": 100
+  },
+  "eslintConfig": {
+    "root": true,
+    "env": {
+      "browser": true,
+      "es2021": true,
+      "node": true,
+      "jest": true
+    },
+    "extends": [
+      "eslint:recommended",
+      "plugin:prettier/recommended"
+    ],
+    "parserOptions": {
+      "ecmaVersion": 12,
+      "sourceType": "module"
+    },
+    "rules": {
+      "prettier/prettier": "error",
+      "no-console": "warn",
+      "no-unused-vars": "warn"
+    }
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/awe-academy/management-system.git"
+  },
+  "keywords": [
+    "school",
+    "management",
+    "education",
+    "admin",
+    "dashboard"
+  ],
+  "author": "AWE Academy Team",
+  "license": "MIT",
+  "bugs": {
+    "url": "https://github.com/awe-academy/management-system/issues"
+  },
+  "homepage": "https://github.com/awe-academy/management-system#readme"
+}
