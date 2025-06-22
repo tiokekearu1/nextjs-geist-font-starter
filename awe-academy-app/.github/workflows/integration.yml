@@ -1,0 +1,336 @@
+name: Integration Testing
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    types: [ opened, synchronize ]
+  workflow_dispatch:
+    inputs:
+      test_suite:
+        description: 'Test suite to run'
+        required: true
+        type: choice
+        options:
+          - all
+          - api
+          - frontend
+          - backend
+          - e2e
+      environment:
+        description: 'Test environment'
+        required: true
+        default: 'staging'
+        type: choice
+        options:
+          - local
+          - staging
+          - qa
+      debug_mode:
+        description: 'Enable debug mode'
+        required: true
+        default: false
+        type: boolean
+
+jobs:
+  prepare:
+    name: Prepare Test Environment
+    runs-on: ubuntu-latest
+    
+    outputs:
+      test_id: ${{ steps.generate.outputs.id }}
+      base_url: ${{ steps.environment.outputs.url }}
+    
+    steps:
+      - name: Generate test ID
+        id: generate
+        run: echo "id=$(date +%Y%m%d_%H%M%S)_$RANDOM" >> $GITHUB_OUTPUT
+
+      - name: Set environment URL
+        id: environment
+        run: |
+          case "${{ github.event.inputs.environment || 'staging' }}" in
+            "local")
+              echo "url=http://localhost:8000" >> $GITHUB_OUTPUT
+              ;;
+            "staging")
+              echo "url=https://staging.aweacademy.com" >> $GITHUB_OUTPUT
+              ;;
+            "qa")
+              echo "url=https://qa.aweacademy.com" >> $GITHUB_OUTPUT
+              ;;
+          esac
+
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '16'
+          cache: 'npm'
+
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.1'
+          extensions: mbstring, xml
+          coverage: xdebug
+
+      - name: Install dependencies
+        run: |
+          composer install --no-interaction --prefer-dist
+          npm ci
+
+      - name: Start application
+        if: github.event.inputs.environment == 'local'
+        run: |
+          php artisan serve &
+          npm run dev &
+          sleep 10
+
+  api:
+    name: API Integration Tests
+    needs: prepare
+    runs-on: ubuntu-latest
+    if: github.event.inputs.test_suite == 'all' || github.event.inputs.test_suite == 'api'
+    
+    steps:
+      - name: Run API tests
+        run: |
+          # Authentication tests
+          php artisan test --group=api-auth
+          
+          # Student management tests
+          php artisan test --group=api-students
+          
+          # Fee management tests
+          php artisan test --group=api-fees
+          
+          # Payment processing tests
+          php artisan test --group=api-payments
+
+      - name: Run API contract tests
+        run: |
+          npm run test:api-contract
+
+      - name: Generate API test report
+        run: |
+          echo "# API Integration Test Report" > api-test-report.md
+          echo "## Test ID: ${{ needs.prepare.outputs.test_id }}" >> api-test-report.md
+          
+          echo "## Test Results" >> api-test-report.md
+          cat ./storage/logs/test-*.log >> api-test-report.md
+          
+          echo "## API Contract Validation" >> api-test-report.md
+          cat ./reports/api-contract.json >> api-test-report.md
+
+      - name: Upload API test results
+        uses: actions/upload-artifact@v3
+        with:
+          name: api-test-results
+          path: |
+            ./storage/logs/test-*.log
+            ./reports/api-contract.json
+            api-test-report.md
+
+  frontend:
+    name: Frontend Integration Tests
+    needs: prepare
+    runs-on: ubuntu-latest
+    if: github.event.inputs.test_suite == 'all' || github.event.inputs.test_suite == 'frontend'
+    
+    steps:
+      - name: Run component tests
+        run: |
+          npm run test:components
+          
+      - name: Run integration tests
+        run: |
+          npm run test:integration
+
+      - name: Run snapshot tests
+        run: |
+          npm run test:snapshot
+
+      - name: Generate frontend test report
+        run: |
+          echo "# Frontend Integration Test Report" > frontend-test-report.md
+          echo "## Test ID: ${{ needs.prepare.outputs.test_id }}" >> frontend-test-report.md
+          
+          echo "## Component Test Results" >> frontend-test-report.md
+          cat ./reports/component-tests.json >> frontend-test-report.md
+          
+          echo "## Integration Test Results" >> frontend-test-report.md
+          cat ./reports/integration-tests.json >> frontend-test-report.md
+          
+          echo "## Snapshot Test Results" >> frontend-test-report.md
+          cat ./reports/snapshot-tests.json >> frontend-test-report.md
+
+      - name: Upload frontend test results
+        uses: actions/upload-artifact@v3
+        with:
+          name: frontend-test-results
+          path: |
+            ./reports/component-tests.json
+            ./reports/integration-tests.json
+            ./reports/snapshot-tests.json
+            frontend-test-report.md
+
+  backend:
+    name: Backend Integration Tests
+    needs: prepare
+    runs-on: ubuntu-latest
+    if: github.event.inputs.test_suite == 'all' || github.event.inputs.test_suite == 'backend'
+    
+    steps:
+      - name: Run unit tests
+        run: |
+          php artisan test --group=unit
+          
+      - name: Run feature tests
+        run: |
+          php artisan test --group=feature
+
+      - name: Run database tests
+        run: |
+          php artisan test --group=database
+
+      - name: Generate backend test report
+        run: |
+          echo "# Backend Integration Test Report" > backend-test-report.md
+          echo "## Test ID: ${{ needs.prepare.outputs.test_id }}" >> backend-test-report.md
+          
+          echo "## Unit Test Results" >> backend-test-report.md
+          cat ./storage/logs/test-unit.log >> backend-test-report.md
+          
+          echo "## Feature Test Results" >> backend-test-report.md
+          cat ./storage/logs/test-feature.log >> backend-test-report.md
+          
+          echo "## Database Test Results" >> backend-test-report.md
+          cat ./storage/logs/test-database.log >> backend-test-report.md
+
+      - name: Upload backend test results
+        uses: actions/upload-artifact@v3
+        with:
+          name: backend-test-results
+          path: |
+            ./storage/logs/test-*.log
+            backend-test-report.md
+
+  e2e:
+    name: End-to-End Tests
+    needs: prepare
+    runs-on: ubuntu-latest
+    if: github.event.inputs.test_suite == 'all' || github.event.inputs.test_suite == 'e2e'
+    
+    steps:
+      - name: Install Cypress
+        run: npm install cypress
+
+      - name: Run Cypress tests
+        run: |
+          npm run cypress:run
+          
+      - name: Run Selenium tests
+        run: |
+          npm run selenium:run
+
+      - name: Generate E2E test report
+        run: |
+          echo "# End-to-End Test Report" > e2e-test-report.md
+          echo "## Test ID: ${{ needs.prepare.outputs.test_id }}" >> e2e-test-report.md
+          
+          echo "## Cypress Test Results" >> e2e-test-report.md
+          cat ./cypress/reports/results.json >> e2e-test-report.md
+          
+          echo "## Selenium Test Results" >> e2e-test-report.md
+          cat ./selenium/reports/results.json >> e2e-test-report.md
+
+      - name: Upload E2E test results
+        uses: actions/upload-artifact@v3
+        with:
+          name: e2e-test-results
+          path: |
+            ./cypress/reports/
+            ./selenium/reports/
+            e2e-test-report.md
+
+  report:
+    name: Generate Test Report
+    needs: [prepare, api, frontend, backend, e2e]
+    runs-on: ubuntu-latest
+    if: always()
+    
+    steps:
+      - name: Download all test results
+        uses: actions/download-artifact@v3
+
+      - name: Generate consolidated report
+        run: |
+          echo "# Integration Test Report" > consolidated-report.md
+          echo "## Test ID: ${{ needs.prepare.outputs.test_id }}" >> consolidated-report.md
+          
+          echo "## API Tests" >> consolidated-report.md
+          cat api-test-results/api-test-report.md >> consolidated-report.md
+          
+          echo "## Frontend Tests" >> consolidated-report.md
+          cat frontend-test-results/frontend-test-report.md >> consolidated-report.md
+          
+          echo "## Backend Tests" >> consolidated-report.md
+          cat backend-test-results/backend-test-report.md >> consolidated-report.md
+          
+          echo "## E2E Tests" >> consolidated-report.md
+          cat e2e-test-results/e2e-test-report.md >> consolidated-report.md
+
+      - name: Upload consolidated report
+        uses: actions/upload-artifact@v3
+        with:
+          name: consolidated-report
+          path: consolidated-report.md
+
+  notify:
+    name: Send Notifications
+    needs: [prepare, report]
+    runs-on: ubuntu-latest
+    if: always()
+    
+    steps:
+      - name: Download consolidated report
+        uses: actions/download-artifact@v3
+        with:
+          name: consolidated-report
+
+      - name: Send Slack notification
+        uses: slackapi/slack-github-action@v1.24.0
+        with:
+          channel-id: 'integration-tests'
+          slack-message: |
+            :test_tube: Integration Tests Complete
+            
+            Test ID: ${{ needs.prepare.outputs.test_id }}
+            Environment: ${{ github.event.inputs.environment || 'staging' }}
+            Suite: ${{ github.event.inputs.test_suite || 'all' }}
+            
+            Status:
+            - API Tests: ${{ needs.api.result }}
+            - Frontend Tests: ${{ needs.frontend.result }}
+            - Backend Tests: ${{ needs.backend.result }}
+            - E2E Tests: ${{ needs.e2e.result }}
+            
+            View detailed report: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+
+      - name: Send email notification
+        if: failure()
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: ${{ secrets.SMTP_SERVER }}
+          server_port: ${{ secrets.SMTP_PORT }}
+          username: ${{ secrets.SMTP_USERNAME }}
+          password: ${{ secrets.SMTP_PASSWORD }}
+          subject: "Integration Tests Failed"
+          body: file://consolidated-report.md
+          to: dev-team@aweacademy.com
+          from: AWE Academy Testing <testing@aweacademy.com>
