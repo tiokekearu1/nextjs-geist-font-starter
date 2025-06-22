@@ -1,0 +1,275 @@
+name: System Monitoring
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'  # Run every 5 minutes
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to monitor'
+        required: true
+        default: 'production'
+        type: choice
+        options:
+          - production
+          - staging
+
+jobs:
+  health-check:
+    name: Health Check
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Check API health
+        run: |
+          response=$(curl -s -o response.txt -w "%{http_code}" https://${{ github.event.inputs.environment == 'staging' && 'staging.' || '' }}api.aweacademy.com/health)
+          if [ "$response" != "200" ]; then
+            echo "API health check failed with status $response"
+            cat response.txt
+            exit 1
+          fi
+
+      - name: Check Web health
+        run: |
+          response=$(curl -s -o response.txt -w "%{http_code}" https://${{ github.event.inputs.environment == 'staging' && 'staging.' || '' }}aweacademy.com/health)
+          if [ "$response" != "200" ]; then
+            echo "Web health check failed with status $response"
+            cat response.txt
+            exit 1
+          fi
+
+      - name: Monitor response times
+        run: |
+          endpoints=(
+            "/"
+            "/api/v1/status"
+            "/api/v1/students"
+            "/api/v1/fees"
+          )
+          
+          for endpoint in "${endpoints[@]}"; do
+            start=$(date +%s%N)
+            curl -s -o /dev/null https://${{ github.event.inputs.environment == 'staging' && 'staging.' || '' }}aweacademy.com${endpoint}
+            end=$(date +%s%N)
+            duration=$((($end - $start)/1000000))
+            
+            if [ "$duration" -gt 1000 ]; then
+              echo "Slow response time for ${endpoint}: ${duration}ms"
+              exit 1
+            fi
+            
+            echo "${endpoint}: ${duration}ms" >> response-times.txt
+          done
+
+  resource-monitoring:
+    name: Resource Monitoring
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Check CPU usage
+        run: |
+          cpu_usage=$(aws cloudwatch get-metric-statistics \
+            --namespace AWS/EC2 \
+            --metric-name CPUUtilization \
+            --dimensions Name=InstanceId,Value=${{ secrets.EC2_INSTANCE_ID }} \
+            --start-time $(date -u -v-5M +%Y-%m-%dT%H:%M:%SZ) \
+            --end-time $(date -u +%Y-%m-%dT%H:%M:%SZ) \
+            --period 300 \
+            --statistics Average \
+            --query 'Datapoints[0].Average' \
+            --output text)
+          
+          if [ $(echo "$cpu_usage > 80" | bc -l) -eq 1 ]; then
+            echo "High CPU usage: ${cpu_usage}%"
+            exit 1
+          fi
+
+      - name: Check memory usage
+        run: |
+          memory_usage=$(aws cloudwatch get-metric-statistics \
+            --namespace AWS/EC2 \
+            --metric-name MemoryUtilization \
+            --dimensions Name=InstanceId,Value=${{ secrets.EC2_INSTANCE_ID }} \
+            --start-time $(date -u -v-5M +%Y-%m-%dT%H:%M:%SZ) \
+            --end-time $(date -u +%Y-%m-%dT%H:%M:%SZ) \
+            --period 300 \
+            --statistics Average \
+            --query 'Datapoints[0].Average' \
+            --output text)
+          
+          if [ $(echo "$memory_usage > 80" | bc -l) -eq 1 ]; then
+            echo "High memory usage: ${memory_usage}%"
+            exit 1
+          fi
+
+      - name: Check disk usage
+        run: |
+          disk_usage=$(aws cloudwatch get-metric-statistics \
+            --namespace AWS/EC2 \
+            --metric-name DiskSpaceUtilization \
+            --dimensions Name=InstanceId,Value=${{ secrets.EC2_INSTANCE_ID }} \
+            --start-time $(date -u -v-5M +%Y-%m-%dT%H:%M:%SZ) \
+            --end-time $(date -u +%Y-%m-%dT%H:%M:%SZ) \
+            --period 300 \
+            --statistics Average \
+            --query 'Datapoints[0].Average' \
+            --output text)
+          
+          if [ $(echo "$disk_usage > 80" | bc -l) -eq 1 ]; then
+            echo "High disk usage: ${disk_usage}%"
+            exit 1
+          fi
+
+  error-monitoring:
+    name: Error Monitoring
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Check application logs
+        run: |
+          aws logs filter-log-events \
+            --log-group-name "/aws/aweacademy/${{ github.event.inputs.environment }}" \
+            --filter-pattern "ERROR" \
+            --start-time $(date -u -v-5M +%s000) \
+            --end-time $(date -u +%s000) \
+            > error-logs.json
+          
+          error_count=$(jq length error-logs.json)
+          if [ "$error_count" -gt 0 ]; then
+            echo "Found $error_count errors in logs"
+            jq '.[].message' error-logs.json
+            exit 1
+          fi
+
+      - name: Check error rates
+        run: |
+          error_rate=$(curl -s https://${{ github.event.inputs.environment == 'staging' && 'staging.' || '' }}aweacademy.com/metrics | jq '.error_rate')
+          if [ $(echo "$error_rate > 5" | bc -l) -eq 1 ]; then
+            echo "High error rate: ${error_rate}%"
+            exit 1
+          fi
+
+  database-monitoring:
+    name: Database Monitoring
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Check database connections
+        run: |
+          connections=$(aws cloudwatch get-metric-statistics \
+            --namespace AWS/RDS \
+            --metric-name DatabaseConnections \
+            --dimensions Name=DBInstanceIdentifier,Value=${{ secrets.RDS_INSTANCE_ID }} \
+            --start-time $(date -u -v-5M +%Y-%m-%dT%H:%M:%SZ) \
+            --end-time $(date -u +%Y-%m-%dT%H:%M:%SZ) \
+            --period 300 \
+            --statistics Average \
+            --query 'Datapoints[0].Average' \
+            --output text)
+          
+          if [ $(echo "$connections > 100" | bc -l) -eq 1 ]; then
+            echo "High database connections: ${connections}"
+            exit 1
+          fi
+
+      - name: Check query performance
+        run: |
+          slow_queries=$(aws cloudwatch get-metric-statistics \
+            --namespace AWS/RDS \
+            --metric-name SlowQueries \
+            --dimensions Name=DBInstanceIdentifier,Value=${{ secrets.RDS_INSTANCE_ID }} \
+            --start-time $(date -u -v-5M +%Y-%m-%dT%H:%M:%SZ) \
+            --end-time $(date -u +%Y-%m-%dT%H:%M:%SZ) \
+            --period 300 \
+            --statistics Sum \
+            --query 'Datapoints[0].Sum' \
+            --output text)
+          
+          if [ "$slow_queries" -gt 10 ]; then
+            echo "High number of slow queries: ${slow_queries}"
+            exit 1
+          fi
+
+  notify:
+    name: Send Alerts
+    needs: [health-check, resource-monitoring, error-monitoring, database-monitoring]
+    runs-on: ubuntu-latest
+    if: failure()
+    
+    steps:
+      - name: Send Slack alert
+        uses: slackapi/slack-github-action@v1.24.0
+        with:
+          channel-id: 'system-alerts'
+          slack-message: |
+            :rotating_light: System Alert :rotating_light:
+            
+            Environment: ${{ github.event.inputs.environment }}
+            
+            Status:
+            - Health Check: ${{ needs.health-check.result }}
+            - Resources: ${{ needs.resource-monitoring.result }}
+            - Errors: ${{ needs.error-monitoring.result }}
+            - Database: ${{ needs.database-monitoring.result }}
+            
+            Details: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+
+      - name: Send PagerDuty alert
+        uses: PagerDuty/action@v3
+        if: failure()
+        with:
+          token: ${{ secrets.PAGERDUTY_TOKEN }}
+          event_type: trigger
+          payload: |
+            {
+              "routing_key": "${{ secrets.PAGERDUTY_ROUTING_KEY }}",
+              "event_action": "trigger",
+              "payload": {
+                "summary": "System alert in ${{ github.event.inputs.environment }}",
+                "source": "GitHub Actions",
+                "severity": "critical",
+                "custom_details": {
+                  "health_check": "${{ needs.health-check.result }}",
+                  "resources": "${{ needs.resource-monitoring.result }}",
+                  "errors": "${{ needs.error-monitoring.result }}",
+                  "database": "${{ needs.database-monitoring.result }}"
+                }
+              }
+            }
+
+      - name: Create GitHub issue
+        uses: actions/github-script@v6
+        with:
+          script: |
+            github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `System Alert: ${new Date().toISOString()}`,
+              body: `
+                System monitoring detected issues in ${process.env.ENVIRONMENT}
+                
+                - Health Check: ${process.env.HEALTH_CHECK}
+                - Resources: ${process.env.RESOURCES}
+                - Errors: ${process.env.ERRORS}
+                - Database: ${process.env.DATABASE}
+                
+                [View Details](${process.env.RUN_URL})
+              `,
+              labels: ['alert', 'monitoring']
+            })
+        env:
+          ENVIRONMENT: ${{ github.event.inputs.environment }}
+          HEALTH_CHECK: ${{ needs.health-check.result }}
+          RESOURCES: ${{ needs.resource-monitoring.result }}
+          ERRORS: ${{ needs.error-monitoring.result }}
+          DATABASE: ${{ needs.database-monitoring.result }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
