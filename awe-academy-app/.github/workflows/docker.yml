@@ -1,0 +1,186 @@
+name: Docker Build
+
+on:
+  push:
+    branches: [ main, develop ]
+    tags: [ 'v*.*.*' ]
+  pull_request:
+    branches: [ main, develop ]
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  build:
+    name: Build Docker Image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      security-events: write
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v2
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v4
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,format=long
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v4
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.version }}
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+
+      - name: Upload Trivy scan results
+        uses: github/codeql-action/upload-sarif@v2
+        if: always()
+        with:
+          sarif_file: 'trivy-results.sarif'
+
+  test:
+    name: Test Docker Image
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request'
+    
+    steps:
+      - name: Pull Docker image
+        run: |
+          docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+
+      - name: Run container tests
+        run: |
+          docker run --rm \
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }} \
+            vendor/bin/phpunit
+
+      - name: Check container health
+        run: |
+          docker run -d --name test-container \
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+          sleep 10
+          docker inspect test-container --format='{{.State.Health.Status}}'
+
+  scan:
+    name: Security Scan
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request'
+    
+    steps:
+      - name: Run Snyk Container scan
+        uses: snyk/actions/docker@master
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        with:
+          image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+          args: --file=Dockerfile
+
+      - name: Run Anchore scan
+        uses: anchore/scan-action@v3
+        with:
+          image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+          fail-build: false
+          severity-cutoff: high
+
+  deploy:
+    name: Deploy to Registry
+    needs: [test, scan]
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    
+    steps:
+      - name: Deploy to Docker Hub
+        uses: docker/build-push-action@v4
+        with:
+          push: true
+          tags: |
+            aweacademy/app:latest
+            aweacademy/app:${{ github.ref_name }}
+          platforms: linux/amd64,linux/arm64
+
+      - name: Update Docker Hub description
+        uses: peter-evans/dockerhub-description@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          repository: aweacademy/app
+          short-description: "AWE Academy Management System"
+          readme-filepath: ./README.md
+
+  notify:
+    name: Send Notifications
+    needs: [build, test, scan, deploy]
+    runs-on: ubuntu-latest
+    if: always()
+    
+    steps:
+      - name: Send Slack notification
+        uses: slackapi/slack-github-action@v1.24.0
+        with:
+          channel-id: 'docker-builds'
+          slack-message: |
+            Docker build status:
+            - Build: ${{ needs.build.result }}
+            - Test: ${{ needs.test.result }}
+            - Scan: ${{ needs.scan.result }}
+            - Deploy: ${{ needs.deploy.result }}
+            
+            Image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+
+      - name: Generate report
+        run: |
+          echo "# Docker Build Report" > docker-report.md
+          echo "## Status" >> docker-report.md
+          echo "- Build: ${{ needs.build.result }}" >> docker-report.md
+          echo "- Test: ${{ needs.test.result }}" >> docker-report.md
+          echo "- Scan: ${{ needs.scan.result }}" >> docker-report.md
+          echo "- Deploy: ${{ needs.deploy.result }}" >> docker-report.md
+          echo "" >> docker-report.md
+          echo "## Details" >> docker-report.md
+          echo "- Image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}" >> docker-report.md
+          echo "- Build URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" >> docker-report.md
+
+      - name: Upload report
+        uses: actions/upload-artifact@v3
+        with:
+          name: docker-report
+          path: docker-report.md
