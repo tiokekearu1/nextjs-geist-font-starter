@@ -1,0 +1,313 @@
+name: Security Scanning
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    types: [ opened, synchronize ]
+  schedule:
+    - cron: '0 0 * * *'  # Run daily at midnight UTC
+  workflow_dispatch:
+    inputs:
+      scan_type:
+        description: 'Type of security scan'
+        required: true
+        type: choice
+        options:
+          - all
+          - sast
+          - dast
+          - secrets
+          - dependencies
+      severity_level:
+        description: 'Minimum severity level'
+        required: true
+        default: 'medium'
+        type: choice
+        options:
+          - low
+          - medium
+          - high
+          - critical
+
+jobs:
+  prepare:
+    name: Prepare Security Scan
+    runs-on: ubuntu-latest
+    
+    outputs:
+      scan_id: ${{ steps.generate.outputs.id }}
+    
+    steps:
+      - name: Generate scan ID
+        id: generate
+        run: echo "id=$(date +%Y%m%d_%H%M%S)_$RANDOM" >> $GITHUB_OUTPUT
+
+      - name: Checkout code
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+
+  sast:
+    name: Static Application Security Testing
+    needs: prepare
+    runs-on: ubuntu-latest
+    if: github.event.inputs.scan_type == 'all' || github.event.inputs.scan_type == 'sast'
+    
+    steps:
+      - name: Run SonarQube scan
+        uses: sonarsource/sonarqube-scan-action@master
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+
+      - name: Run PHP security scan
+        run: |
+          composer require --dev phan/phan
+          vendor/bin/phan --output-mode json > phan-results.json
+
+      - name: Run NodeJS security scan
+        run: |
+          npm install -g njsscan
+          njsscan . --json > njsscan-results.json
+
+      - name: Generate SAST report
+        run: |
+          echo "# Static Application Security Testing Report" > sast-report.md
+          echo "## Scan ID: ${{ needs.prepare.outputs.scan_id }}" >> sast-report.md
+          
+          echo "## SonarQube Results" >> sast-report.md
+          jq -r '.[] | select(.severity >= "${{ github.event.inputs.severity_level }}") | "- [\(.severity)] \(.message)"' sonar-results.json >> sast-report.md
+          
+          echo "## PHP Security Issues" >> sast-report.md
+          jq -r '.[] | select(.severity >= "${{ github.event.inputs.severity_level }}") | "- [\(.severity)] \(.description) in \(.file):\(.line)"' phan-results.json >> sast-report.md
+          
+          echo "## NodeJS Security Issues" >> sast-report.md
+          jq -r '.vulnerabilities[] | select(.severity >= "${{ github.event.inputs.severity_level }}") | "- [\(.severity)] \(.title) in \(.filename)"' njsscan-results.json >> sast-report.md
+
+      - name: Upload SAST results
+        uses: actions/upload-artifact@v3
+        with:
+          name: sast-results
+          path: |
+            sonar-results.json
+            phan-results.json
+            njsscan-results.json
+            sast-report.md
+
+  dast:
+    name: Dynamic Application Security Testing
+    needs: prepare
+    runs-on: ubuntu-latest
+    if: github.event.inputs.scan_type == 'all' || github.event.inputs.scan_type == 'dast'
+    
+    steps:
+      - name: Start application
+        run: |
+          npm run build
+          PORT=8000 npm run start &
+          sleep 10
+
+      - name: Run OWASP ZAP scan
+        uses: zaproxy/action-full-scan@v0.7.0
+        with:
+          target: 'http://localhost:8000'
+          rules_file_name: '.zap/rules.tsv'
+          cmd_options: '-a'
+
+      - name: Run Nikto scan
+        run: |
+          docker run --rm \
+            -v $(pwd)/nikto-results:/tmp \
+            secfigo/nikto:latest \
+            -h http://localhost:8000 \
+            -Format json \
+            -output /tmp/nikto-results.json
+
+      - name: Generate DAST report
+        run: |
+          echo "# Dynamic Application Security Testing Report" > dast-report.md
+          echo "## Scan ID: ${{ needs.prepare.outputs.scan_id }}" >> dast-report.md
+          
+          echo "## ZAP Scan Results" >> dast-report.md
+          jq -r '.site[].alerts[] | select(.risk >= "${{ github.event.inputs.severity_level }}") | "- [\(.risk)] \(.name): \(.description)"' zap-results.json >> dast-report.md
+          
+          echo "## Nikto Scan Results" >> dast-report.md
+          jq -r '.vulnerabilities[] | select(.severity >= "${{ github.event.inputs.severity_level }}") | "- [\(.severity)] \(.title): \(.description)"' nikto-results/nikto-results.json >> dast-report.md
+
+      - name: Upload DAST results
+        uses: actions/upload-artifact@v3
+        with:
+          name: dast-results
+          path: |
+            zap-results.json
+            nikto-results/
+            dast-report.md
+
+  secrets:
+    name: Secrets Scanning
+    needs: prepare
+    runs-on: ubuntu-latest
+    if: github.event.inputs.scan_type == 'all' || github.event.inputs.scan_type == 'secrets'
+    
+    steps:
+      - name: Run Gitleaks scan
+        uses: zricethezav/gitleaks-action@master
+        with:
+          config-path: .gitleaks.toml
+          output-format: json
+          output-path: gitleaks-results.json
+
+      - name: Run TruffleHog scan
+        run: |
+          pip install trufflehog
+          trufflehog filesystem . --json > trufflehog-results.json
+
+      - name: Generate secrets report
+        run: |
+          echo "# Secrets Scanning Report" > secrets-report.md
+          echo "## Scan ID: ${{ needs.prepare.outputs.scan_id }}" >> secrets-report.md
+          
+          echo "## Gitleaks Results" >> secrets-report.md
+          jq -r '.[] | select(.severity >= "${{ github.event.inputs.severity_level }}") | "- [\(.severity)] \(.description) in \(.file)"' gitleaks-results.json >> secrets-report.md
+          
+          echo "## TruffleHog Results" >> secrets-report.md
+          jq -r '.[] | select(.severity >= "${{ github.event.inputs.severity_level }}") | "- [\(.severity)] Secret found in \(.path)"' trufflehog-results.json >> secrets-report.md
+
+      - name: Upload secrets results
+        uses: actions/upload-artifact@v3
+        with:
+          name: secrets-results
+          path: |
+            gitleaks-results.json
+            trufflehog-results.json
+            secrets-report.md
+
+  dependencies:
+    name: Dependencies Security Scan
+    needs: prepare
+    runs-on: ubuntu-latest
+    if: github.event.inputs.scan_type == 'all' || github.event.inputs.scan_type == 'dependencies'
+    
+    steps:
+      - name: Run NPM audit
+        run: npm audit --json > npm-audit.json
+
+      - name: Run Composer audit
+        run: composer audit --format=json > composer-audit.json
+
+      - name: Run Python safety check
+        run: |
+          pip install safety
+          safety check --json > python-audit.json
+
+      - name: Generate dependencies report
+        run: |
+          echo "# Dependencies Security Report" > dependencies-report.md
+          echo "## Scan ID: ${{ needs.prepare.outputs.scan_id }}" >> dependencies-report.md
+          
+          echo "## NPM Vulnerabilities" >> dependencies-report.md
+          jq -r '.advisories[] | select(.severity >= "${{ github.event.inputs.severity_level }}") | "- [\(.severity)] \(.title) in \(.module_name)"' npm-audit.json >> dependencies-report.md
+          
+          echo "## Composer Vulnerabilities" >> dependencies-report.md
+          jq -r '.advisories[] | select(.severity >= "${{ github.event.inputs.severity_level }}") | "- [\(.severity)] \(.title) in \(.package)"' composer-audit.json >> dependencies-report.md
+          
+          echo "## Python Vulnerabilities" >> dependencies-report.md
+          jq -r '.[] | select(.severity >= "${{ github.event.inputs.severity_level }}") | "- [\(.severity)] \(.advisory) in \(.package)"' python-audit.json >> dependencies-report.md
+
+      - name: Upload dependencies results
+        uses: actions/upload-artifact@v3
+        with:
+          name: dependencies-results
+          path: |
+            npm-audit.json
+            composer-audit.json
+            python-audit.json
+            dependencies-report.md
+
+  consolidate:
+    name: Consolidate Reports
+    needs: [prepare, sast, dast, secrets, dependencies]
+    runs-on: ubuntu-latest
+    if: always()
+    
+    steps:
+      - name: Download all reports
+        uses: actions/download-artifact@v3
+
+      - name: Generate consolidated report
+        run: |
+          echo "# Security Scanning Report" > consolidated-report.md
+          echo "## Scan ID: ${{ needs.prepare.outputs.scan_id }}" >> consolidated-report.md
+          echo "## Severity Level: ${{ github.event.inputs.severity_level || 'medium' }}" >> consolidated-report.md
+          
+          echo "## Static Analysis Results" >> consolidated-report.md
+          cat sast-results/sast-report.md >> consolidated-report.md
+          
+          echo "## Dynamic Analysis Results" >> consolidated-report.md
+          cat dast-results/dast-report.md >> consolidated-report.md
+          
+          echo "## Secrets Scan Results" >> consolidated-report.md
+          cat secrets-results/secrets-report.md >> consolidated-report.md
+          
+          echo "## Dependencies Scan Results" >> consolidated-report.md
+          cat dependencies-results/dependencies-report.md >> consolidated-report.md
+
+      - name: Upload consolidated report
+        uses: actions/upload-artifact@v3
+        with:
+          name: consolidated-report
+          path: consolidated-report.md
+
+  notify:
+    name: Send Notifications
+    needs: [prepare, consolidate]
+    runs-on: ubuntu-latest
+    if: always()
+    
+    steps:
+      - name: Download consolidated report
+        uses: actions/download-artifact@v3
+        with:
+          name: consolidated-report
+
+      - name: Send Slack notification
+        uses: slackapi/slack-github-action@v1.24.0
+        with:
+          channel-id: 'security'
+          slack-message: |
+            :shield: Security Scan Complete
+            
+            Scan ID: ${{ needs.prepare.outputs.scan_id }}
+            Type: ${{ github.event.inputs.scan_type || 'all' }}
+            Severity Level: ${{ github.event.inputs.severity_level || 'medium' }}
+            
+            Status:
+            - SAST: ${{ needs.sast.result }}
+            - DAST: ${{ needs.dast.result }}
+            - Secrets: ${{ needs.secrets.result }}
+            - Dependencies: ${{ needs.dependencies.result }}
+            
+            View detailed report: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+
+      - name: Send email notification
+        if: failure() || contains(github.event.inputs.severity_level, 'critical')
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: ${{ secrets.SMTP_SERVER }}
+          server_port: ${{ secrets.SMTP_PORT }}
+          username: ${{ secrets.SMTP_USERNAME }}
+          password: ${{ secrets.SMTP_PASSWORD }}
+          subject: "Security Scan Alert"
+          body: |
+            Security scan has detected critical issues.
+            
+            Scan ID: ${{ needs.prepare.outputs.scan_id }}
+            Type: ${{ github.event.inputs.scan_type || 'all' }}
+            Severity Level: ${{ github.event.inputs.severity_level || 'medium' }}
+            
+            Check the detailed report: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          to: security@aweacademy.com
+          from: AWE Academy Security <security@aweacademy.com>
