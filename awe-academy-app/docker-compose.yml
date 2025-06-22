@@ -1,0 +1,101 @@
+version: '3.8'
+
+services:
+  # PHP Application
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: awe_academy_app
+    restart: unless-stopped
+    environment:
+      - APP_ENV=${APP_ENV}
+      - APP_DEBUG=${APP_DEBUG}
+      - DB_HOST=db
+      - DB_DATABASE=${DB_DATABASE}
+      - DB_USERNAME=${DB_USERNAME}
+      - DB_PASSWORD=${DB_PASSWORD}
+    volumes:
+      - .:/var/www/html
+      - ./storage/logs:/var/www/html/storage/logs
+      - ./uploads:/var/www/html/uploads
+    networks:
+      - awe_network
+    depends_on:
+      - db
+    ports:
+      - "8000:80"
+
+  # MySQL Database
+  db:
+    image: mysql:8.0
+    container_name: awe_academy_db
+    restart: unless-stopped
+    environment:
+      - MYSQL_DATABASE=${DB_DATABASE}
+      - MYSQL_USER=${DB_USERNAME}
+      - MYSQL_PASSWORD=${DB_PASSWORD}
+      - MYSQL_ROOT_PASSWORD=${DB_ROOT_PASSWORD}
+    volumes:
+      - dbdata:/var/lib/mysql
+      - ./database/schema.sql:/docker-entrypoint-initdb.d/schema.sql
+    networks:
+      - awe_network
+    ports:
+      - "3306:3306"
+
+  # Redis Cache
+  redis:
+    image: redis:alpine
+    container_name: awe_academy_redis
+    restart: unless-stopped
+    networks:
+      - awe_network
+    ports:
+      - "6379:6379"
+
+  # PHPMyAdmin
+  phpmyadmin:
+    image: phpmyadmin/phpmyadmin
+    container_name: awe_academy_phpmyadmin
+    environment:
+      - PMA_HOST=db
+      - PMA_PORT=3306
+      - PMA_USER=${DB_USERNAME}
+      - PMA_PASSWORD=${DB_PASSWORD}
+    networks:
+      - awe_network
+    ports:
+      - "8080:80"
+    depends_on:
+      - db
+
+  # Mailhog for email testing
+  mailhog:
+    image: mailhog/mailhog
+    container_name: awe_academy_mailhog
+    networks:
+      - awe_network
+    ports:
+      - "1025:1025"
+      - "8025:8025"
+
+  # Node service for frontend development
+  node:
+    image: node:16-alpine
+    container_name: awe_academy_node
+    working_dir: /var/www/html
+    volumes:
+      - .:/var/www/html
+    command: >
+      sh -c "npm install && npm run watch"
+    networks:
+      - awe_network
+
+networks:
+  awe_network:
+    driver: bridge
+
+volumes:
+  dbdata:
+    driver: local
