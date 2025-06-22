@@ -1,0 +1,15 @@
+# Disallow access to sensitive directories
+User-agent: *
+Disallow: /config/
+Disallow: /includes/
+Disallow: /database/
+Disallow: /modules/
+Disallow: /uploads/
+
+# Allow access to public files
+Allow: /assets/
+Allow: /index.php
+Allow: /404.php
+
+# Sitemap location (uncomment and update in production)
+# Sitemap: https://yourdomain.com/sitemap.xml
