@@ -1,0 +1,287 @@
+name: Compliance and Audit
+
+on:
+  schedule:
+    - cron: '0 0 * * 0'  # Run weekly on Sundays at midnight UTC
+  workflow_dispatch:
+    inputs:
+      audit_type:
+        description: 'Type of audit to perform'
+        required: true
+        default: 'full'
+        type: choice
+        options:
+          - full
+          - security
+          - privacy
+          - licensing
+
+jobs:
+  security-compliance:
+    name: Security Compliance
+    runs-on: ubuntu-latest
+    if: github.event.inputs.audit_type == 'full' || github.event.inputs.audit_type == 'security'
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Check security headers
+        run: |
+          response=$(curl -s -I https://aweacademy.com)
+          
+          headers=(
+            "Strict-Transport-Security"
+            "Content-Security-Policy"
+            "X-Frame-Options"
+            "X-Content-Type-Options"
+            "Referrer-Policy"
+            "Permissions-Policy"
+          )
+          
+          for header in "${headers[@]}"; do
+            if ! echo "$response" | grep -q "^$header:"; then
+              echo "Missing security header: $header"
+              exit 1
+            fi
+          done
+
+      - name: Check SSL/TLS configuration
+        run: |
+          result=$(curl -s https://api.ssllabs.com/api/v3/analyze?host=aweacademy.com)
+          grade=$(echo $result | jq -r '.endpoints[0].grade')
+          
+          if [[ "$grade" != "A" && "$grade" != "A+" ]]; then
+            echo "SSL/TLS grade below A: $grade"
+            exit 1
+          fi
+
+      - name: Check for sensitive data exposure
+        run: |
+          patterns=(
+            "password"
+            "secret"
+            "api[_-]key"
+            "token"
+            "credentials"
+          )
+          
+          for pattern in "${patterns[@]}"; do
+            if git log -p | grep -i "$pattern"; then
+              echo "Potential sensitive data in git history: $pattern"
+              exit 1
+            fi
+          done
+
+  privacy-compliance:
+    name: Privacy Compliance
+    runs-on: ubuntu-latest
+    if: github.event.inputs.audit_type == 'full' || github.event.inputs.audit_type == 'privacy'
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Check for privacy policy
+        run: |
+          if [ ! -f "privacy-policy.md" ] && [ ! -f "privacy.md" ]; then
+            echo "Privacy policy file missing"
+            exit 1
+          fi
+
+      - name: Check cookie compliance
+        run: |
+          response=$(curl -s https://aweacademy.com)
+          if ! echo "$response" | grep -q "cookie-consent"; then
+            echo "Cookie consent mechanism not found"
+            exit 1
+          fi
+
+      - name: Check data retention policies
+        run: |
+          if ! grep -r "data retention" .; then
+            echo "Data retention policies not found"
+            exit 1
+          fi
+
+  license-compliance:
+    name: License Compliance
+    runs-on: ubuntu-latest
+    if: github.event.inputs.audit_type == 'full' || github.event.inputs.audit_type == 'licensing'
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.1'
+          extensions: mbstring, intl
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '16'
+          cache: 'npm'
+
+      - name: Check PHP dependencies licenses
+        run: |
+          composer install --no-progress
+          composer license-check
+
+      - name: Check JavaScript dependencies licenses
+        run: |
+          npm ci
+          npx license-checker --summary
+          npx license-checker --failOn GPL
+
+      - name: Check license headers
+        run: |
+          find . -type f -name "*.php" -o -name "*.js" | while read file; do
+            if ! head -n 5 "$file" | grep -q "Copyright"; then
+              echo "Missing license header in $file"
+              exit 1
+            fi
+          done
+
+  accessibility-compliance:
+    name: Accessibility Compliance
+    runs-on: ubuntu-latest
+    if: github.event.inputs.audit_type == 'full'
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '16'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: |
+          npm install -g pa11y-ci
+          npm ci
+
+      - name: Check WCAG compliance
+        run: |
+          pa11y-ci --config .pa11yci.json
+          if [ $? -ne 0 ]; then
+            echo "WCAG compliance issues found"
+            exit 1
+          fi
+
+  documentation-compliance:
+    name: Documentation Compliance
+    runs-on: ubuntu-latest
+    if: github.event.inputs.audit_type == 'full'
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Check required documentation
+        run: |
+          required_docs=(
+            "README.md"
+            "CONTRIBUTING.md"
+            "LICENSE"
+            "CODE_OF_CONDUCT.md"
+            "SECURITY.md"
+          )
+          
+          for doc in "${required_docs[@]}"; do
+            if [ ! -f "$doc" ]; then
+              echo "Missing required document: $doc"
+              exit 1
+            fi
+          done
+
+      - name: Validate documentation links
+        uses: gaurav-nelson/github-action-markdown-link-check@v1
+        with:
+          use-quiet-mode: 'yes'
+          use-verbose-mode: 'yes'
+          config-file: '.markdown-link-check.json'
+          folder-path: '.'
+
+  report:
+    name: Generate Compliance Report
+    needs: [security-compliance, privacy-compliance, license-compliance, accessibility-compliance, documentation-compliance]
+    runs-on: ubuntu-latest
+    if: always()
+    
+    steps:
+      - name: Generate report
+        run: |
+          echo "# Compliance Audit Report" > compliance-report.md
+          echo "## Status" >> compliance-report.md
+          echo "- Security: ${{ needs.security-compliance.result }}" >> compliance-report.md
+          echo "- Privacy: ${{ needs.privacy-compliance.result }}" >> compliance-report.md
+          echo "- Licensing: ${{ needs.license-compliance.result }}" >> compliance-report.md
+          echo "- Accessibility: ${{ needs.accessibility-compliance.result }}" >> compliance-report.md
+          echo "- Documentation: ${{ needs.documentation-compliance.result }}" >> compliance-report.md
+
+      - name: Upload report
+        uses: actions/upload-artifact@v3
+        with:
+          name: compliance-report
+          path: compliance-report.md
+
+      - name: Create GitHub issue
+        if: failure()
+        uses: actions/github-script@v6
+        with:
+          script: |
+            const fs = require('fs');
+            const report = fs.readFileSync('compliance-report.md', 'utf8');
+            
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: 'Compliance Issues Found',
+              body: report,
+              labels: ['compliance', 'audit']
+            });
+
+  notify:
+    name: Send Notifications
+    needs: report
+    runs-on: ubuntu-latest
+    if: always()
+    
+    steps:
+      - name: Send Slack notification
+        uses: slackapi/slack-github-action@v1.24.0
+        with:
+          channel-id: 'compliance'
+          slack-message: |
+            Compliance Audit Results:
+            
+            - Security: ${{ needs.security-compliance.result }}
+            - Privacy: ${{ needs.privacy-compliance.result }}
+            - Licensing: ${{ needs.license-compliance.result }}
+            - Accessibility: ${{ needs.accessibility-compliance.result }}
+            - Documentation: ${{ needs.documentation-compliance.result }}
+            
+            View detailed report: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+
+      - name: Send email report
+        uses: dawidd6/action-send-mail@v3
+        if: failure()
+        with:
+          server_address: ${{ secrets.SMTP_SERVER }}
+          server_port: ${{ secrets.SMTP_PORT }}
+          username: ${{ secrets.SMTP_USERNAME }}
+          password: ${{ secrets.SMTP_PASSWORD }}
+          subject: "Compliance Audit Results"
+          body: |
+            Compliance issues found in the latest audit.
+            
+            Check the detailed report: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          to: compliance@aweacademy.com
+          from: AWE Academy Compliance <compliance@aweacademy.com>
