@@ -1,0 +1,159 @@
+name: Security Scan
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+  schedule:
+    - cron: '0 0 * * *'  # Run daily at midnight UTC
+
+jobs:
+  security-scan:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.1'
+          extensions: mbstring, intl, gd, xml, zip, pdo_mysql
+          coverage: none
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '16'
+          cache: 'npm'
+
+      - name: Cache dependencies
+        uses: actions/cache@v3
+        with:
+          path: |
+            vendor
+            node_modules
+          key: ${{ runner.os }}-security-${{ hashFiles('**/composer.lock', '**/package-lock.json') }}
+
+      - name: Install dependencies
+        run: |
+          composer install --no-dev --no-progress
+          npm ci
+
+      - name: PHP Security Check
+        uses: symfonycorp/security-checker-action@v4
+
+      - name: NPM Audit
+        run: npm audit --audit-level=moderate
+
+      - name: Run Snyk to check for vulnerabilities
+        uses: snyk/actions/node@master
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        with:
+          args: --severity-threshold=medium
+
+      - name: OWASP Dependency Check
+        uses: dependency-check/Dependency-Check_Action@main
+        with:
+          project: 'AWE Academy'
+          path: '.'
+          format: 'HTML'
+          out: 'reports'
+          args: >
+            --suppression suppression.xml
+            --failOnCVSS 7
+            --enableRetired
+
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          format: 'table'
+          exit-code: '1'
+          ignore-unfixed: true
+          severity: 'CRITICAL,HIGH'
+
+      - name: SonarCloud Scan
+        uses: SonarSource/sonarcloud-github-action@master
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+
+      - name: Run PHP Security Checker
+        uses: StephaneBour/actions-php-security-checker@1.1
+        with:
+          composer-lock: './composer.lock'
+
+      - name: Check for exposed secrets
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Run Security Headers Check
+        run: |
+          curl -X GET \
+            -H "X-SecurityHeaders-Check: true" \
+            -s -D - https://${DOMAIN}/security-headers \
+            -o /dev/null
+        env:
+          DOMAIN: ${{ secrets.DOMAIN }}
+
+      - name: Upload security scan results
+        uses: actions/upload-artifact@v3
+        if: always()
+        with:
+          name: security-scan-results
+          path: |
+            reports/
+            snyk-results.json
+            trivy-results.json
+
+      - name: Send Slack notification
+        if: failure()
+        uses: slackapi/slack-github-action@v1.24.0
+        with:
+          channel-id: 'security-alerts'
+          slack-message: 'Security scan failed! :rotating_light: Check details: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}'
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+
+  security-compliance:
+    name: Security Compliance Check
+    needs: security-scan
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Check security policy
+        run: |
+          if [ ! -f SECURITY.md ]; then
+            echo "Security policy file missing"
+            exit 1
+          fi
+
+      - name: Verify security headers
+        run: |
+          response=$(curl -s -I https://${DOMAIN})
+          echo "$response" | grep -q "Strict-Transport-Security" || exit 1
+          echo "$response" | grep -q "Content-Security-Policy" || exit 1
+          echo "$response" | grep -q "X-Frame-Options" || exit 1
+        env:
+          DOMAIN: ${{ secrets.DOMAIN }}
+
+      - name: Generate security report
+        if: always()
+        run: |
+          echo "Security Compliance Report" > security-report.md
+          echo "Generated on: $(date)" >> security-report.md
+          echo "Status: ${{ job.status }}" >> security-report.md
+
+      - name: Upload security report
+        uses: actions/upload-artifact@v3
+        if: always()
+        with:
+          name: security-compliance-report
+          path: security-report.md
