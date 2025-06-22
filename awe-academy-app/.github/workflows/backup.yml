@@ -1,0 +1,258 @@
+name: Backup Management
+
+on:
+  schedule:
+    - cron: '0 1 * * *'  # Daily backup at 1 AM UTC
+    - cron: '0 */6 * * *'  # Incremental backup every 6 hours
+  workflow_dispatch:
+    inputs:
+      backup_type:
+        description: 'Type of backup to perform'
+        required: true
+        type: choice
+        options:
+          - full
+          - incremental
+          - database
+          - files
+      retention_days:
+        description: 'Number of days to retain backup'
+        required: true
+        default: '30'
+        type: string
+
+jobs:
+  prepare:
+    name: Prepare Backup
+    runs-on: ubuntu-latest
+    
+    outputs:
+      backup_id: ${{ steps.generate.outputs.id }}
+      timestamp: ${{ steps.generate.outputs.timestamp }}
+    
+    steps:
+      - name: Generate backup ID
+        id: generate
+        run: |
+          echo "id=$(date +%Y%m%d_%H%M%S)_$RANDOM" >> $GITHUB_OUTPUT
+          echo "timestamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ")" >> $GITHUB_OUTPUT
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+  database:
+    name: Database Backup
+    needs: prepare
+    runs-on: ubuntu-latest
+    if: github.event.inputs.backup_type == 'full' || github.event.inputs.backup_type == 'database'
+    
+    steps:
+      - name: Install MySQL client
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mysql-client
+
+      - name: Backup database
+        run: |
+          mysqldump \
+            -h ${{ secrets.DB_HOST }} \
+            -u ${{ secrets.DB_USERNAME }} \
+            -p${{ secrets.DB_PASSWORD }} \
+            --single-transaction \
+            --quick \
+            --lock-tables=false \
+            --routines \
+            --triggers \
+            --events \
+            ${{ secrets.DB_DATABASE }} | gzip > database.sql.gz
+
+      - name: Upload to S3
+        run: |
+          aws s3 cp \
+            database.sql.gz \
+            s3://${{ secrets.BACKUP_BUCKET }}/${{ needs.prepare.outputs.backup_id }}/database.sql.gz
+
+      - name: Verify backup
+        run: |
+          aws s3 ls s3://${{ secrets.BACKUP_BUCKET }}/${{ needs.prepare.outputs.backup_id }}/database.sql.gz
+
+  files:
+    name: Files Backup
+    needs: prepare
+    runs-on: ubuntu-latest
+    if: github.event.inputs.backup_type == 'full' || github.event.inputs.backup_type == 'files'
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Backup files
+        run: |
+          tar -czf files.tar.gz \
+            --exclude='.git' \
+            --exclude='node_modules' \
+            --exclude='vendor' \
+            --exclude='storage/logs' \
+            --exclude='storage/framework/cache' \
+            .
+
+      - name: Upload to S3
+        run: |
+          aws s3 cp \
+            files.tar.gz \
+            s3://${{ secrets.BACKUP_BUCKET }}/${{ needs.prepare.outputs.backup_id }}/files.tar.gz
+
+      - name: Verify backup
+        run: |
+          aws s3 ls s3://${{ secrets.BACKUP_BUCKET }}/${{ needs.prepare.outputs.backup_id }}/files.tar.gz
+
+  assets:
+    name: Assets Backup
+    needs: prepare
+    runs-on: ubuntu-latest
+    if: github.event.inputs.backup_type == 'full' || github.event.inputs.backup_type == 'files'
+    
+    steps:
+      - name: Sync assets from S3
+        run: |
+          aws s3 sync \
+            s3://${{ secrets.ASSETS_BUCKET }}/ \
+            s3://${{ secrets.BACKUP_BUCKET }}/${{ needs.prepare.outputs.backup_id }}/assets/
+
+      - name: Verify backup
+        run: |
+          aws s3 ls s3://${{ secrets.BACKUP_BUCKET }}/${{ needs.prepare.outputs.backup_id }}/assets/
+
+  config:
+    name: Configuration Backup
+    needs: prepare
+    runs-on: ubuntu-latest
+    if: github.event.inputs.backup_type == 'full'
+    
+    steps:
+      - name: Backup configuration
+        run: |
+          aws ssm get-parameters-by-path \
+            --path "/" \
+            --recursive \
+            --with-decryption \
+            --output json > config.json
+
+      - name: Upload to S3
+        run: |
+          aws s3 cp \
+            config.json \
+            s3://${{ secrets.BACKUP_BUCKET }}/${{ needs.prepare.outputs.backup_id }}/config.json
+
+      - name: Verify backup
+        run: |
+          aws s3 ls s3://${{ secrets.BACKUP_BUCKET }}/${{ needs.prepare.outputs.backup_id }}/config.json
+
+  cleanup:
+    name: Cleanup Old Backups
+    needs: [prepare, database, files, assets, config]
+    runs-on: ubuntu-latest
+    if: always()
+    
+    steps:
+      - name: Remove old backups
+        run: |
+          retention_days="${{ github.event.inputs.retention_days || '30' }}"
+          cutoff_date=$(date -d "$retention_days days ago" +%s)
+          
+          aws s3api list-objects-v2 \
+            --bucket ${{ secrets.BACKUP_BUCKET }} \
+            --query "Contents[?LastModified<='${cutoff_date}']" \
+            --output text | \
+          while read -r line; do
+            aws s3 rm "s3://${{ secrets.BACKUP_BUCKET }}/${line##* }"
+          done
+
+  verify:
+    name: Verify Backup
+    needs: [prepare, database, files, assets, config, cleanup]
+    runs-on: ubuntu-latest
+    if: always()
+    
+    steps:
+      - name: Check backup integrity
+        run: |
+          aws s3api head-object \
+            --bucket ${{ secrets.BACKUP_BUCKET }} \
+            --key ${{ needs.prepare.outputs.backup_id }}/database.sql.gz
+          
+          aws s3api head-object \
+            --bucket ${{ secrets.BACKUP_BUCKET }} \
+            --key ${{ needs.prepare.outputs.backup_id }}/files.tar.gz
+
+      - name: Generate backup manifest
+        run: |
+          echo '{
+            "backup_id": "${{ needs.prepare.outputs.backup_id }}",
+            "timestamp": "${{ needs.prepare.outputs.timestamp }}",
+            "type": "${{ github.event.inputs.backup_type || 'scheduled' }}",
+            "components": {
+              "database": "${{ needs.database.result }}",
+              "files": "${{ needs.files.result }}",
+              "assets": "${{ needs.assets.result }}",
+              "config": "${{ needs.config.result }}"
+            }
+          }' > manifest.json
+
+      - name: Upload manifest
+        run: |
+          aws s3 cp \
+            manifest.json \
+            s3://${{ secrets.BACKUP_BUCKET }}/${{ needs.prepare.outputs.backup_id }}/manifest.json
+
+  notify:
+    name: Send Notifications
+    needs: [prepare, verify]
+    runs-on: ubuntu-latest
+    if: always()
+    
+    steps:
+      - name: Send Slack notification
+        uses: slackapi/slack-github-action@v1.24.0
+        with:
+          channel-id: 'backups'
+          slack-message: |
+            :package: Backup Complete
+            
+            ID: ${{ needs.prepare.outputs.backup_id }}
+            Type: ${{ github.event.inputs.backup_type || 'scheduled' }}
+            Timestamp: ${{ needs.prepare.outputs.timestamp }}
+            
+            Components:
+            - Database: ${{ needs.database.result }}
+            - Files: ${{ needs.files.result }}
+            - Assets: ${{ needs.assets.result }}
+            - Config: ${{ needs.config.result }}
+            
+            Location: s3://${{ secrets.BACKUP_BUCKET }}/${{ needs.prepare.outputs.backup_id }}/
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+
+      - name: Send email notification
+        if: failure()
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: ${{ secrets.SMTP_SERVER }}
+          server_port: ${{ secrets.SMTP_PORT }}
+          username: ${{ secrets.SMTP_USERNAME }}
+          password: ${{ secrets.SMTP_PASSWORD }}
+          subject: "Backup Failed"
+          body: |
+            Backup process has failed.
+            
+            ID: ${{ needs.prepare.outputs.backup_id }}
+            Type: ${{ github.event.inputs.backup_type || 'scheduled' }}
+            Timestamp: ${{ needs.prepare.outputs.timestamp }}
+            
+            Check the logs: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          to: ops@aweacademy.com
+          from: AWE Academy Backups <backups@aweacademy.com>
