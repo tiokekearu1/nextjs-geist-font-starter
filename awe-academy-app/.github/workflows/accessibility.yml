@@ -1,0 +1,329 @@
+name: Accessibility Testing
+
+on:
+  push:
+    branches: [ main, develop ]
+    paths:
+      - '**/*.html'
+      - '**/*.php'
+      - '**/*.js'
+      - '**/*.css'
+      - '**/*.vue'
+      - '**/*.jsx'
+      - '**/*.tsx'
+  pull_request:
+    paths:
+      - '**/*.html'
+      - '**/*.php'
+      - '**/*.js'
+      - '**/*.css'
+      - '**/*.vue'
+      - '**/*.jsx'
+      - '**/*.tsx'
+  workflow_dispatch:
+    inputs:
+      test_level:
+        description: 'Level of accessibility testing'
+        required: true
+        default: 'AA'
+        type: choice
+        options:
+          - A
+          - AA
+          - AAA
+      test_scope:
+        description: 'Scope of testing'
+        required: true
+        type: choice
+        options:
+          - all
+          - critical
+          - changed
+      urls:
+        description: 'Specific URLs to test (comma-separated)'
+        required: false
+        type: string
+
+jobs:
+  prepare:
+    name: Prepare Testing Environment
+    runs-on: ubuntu-latest
+    
+    outputs:
+      test_id: ${{ steps.generate.outputs.id }}
+      urls: ${{ steps.urls.outputs.list }}
+    
+    steps:
+      - name: Generate test ID
+        id: generate
+        run: echo "id=$(date +%Y%m%d_%H%M%S)_$RANDOM" >> $GITHUB_OUTPUT
+
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '16'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: |
+          npm install -g pa11y-ci axe-core puppeteer
+          npm ci
+
+      - name: Start application
+        run: |
+          npm run build
+          PORT=8000 npm run start &
+          sleep 10
+
+      - name: Generate URL list
+        id: urls
+        run: |
+          if [[ -n "${{ github.event.inputs.urls }}" ]]; then
+            echo "list=${{ github.event.inputs.urls }}" >> $GITHUB_OUTPUT
+          else
+            echo "list=http://localhost:8000,http://localhost:8000/dashboard,http://localhost:8000/students,http://localhost:8000/fees" >> $GITHUB_OUTPUT
+          fi
+
+  static-analysis:
+    name: Static Accessibility Analysis
+    needs: prepare
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Run HTML validation
+        run: |
+          npm install -g html-validator-cli
+          find . -type f -name "*.html" -exec html-validator --file {} --verbose \; > html-validation.txt
+
+      - name: Run CSS analysis
+        run: |
+          npm install -g stylelint stylelint-a11y
+          npx stylelint "**/*.css" --config .stylelintrc.json > css-analysis.txt
+
+      - name: Run JavaScript analysis
+        run: |
+          npm install -g eslint eslint-plugin-jsx-a11y
+          npx eslint . --ext .js,.jsx,.ts,.tsx --config .eslintrc.json > js-analysis.txt
+
+      - name: Generate static analysis report
+        run: |
+          echo "# Static Accessibility Analysis" > static-analysis-report.md
+          echo "## Test ID: ${{ needs.prepare.outputs.test_id }}" >> static-analysis-report.md
+          
+          echo "## HTML Validation" >> static-analysis-report.md
+          cat html-validation.txt >> static-analysis-report.md
+          
+          echo "## CSS Analysis" >> static-analysis-report.md
+          cat css-analysis.txt >> static-analysis-report.md
+          
+          echo "## JavaScript Analysis" >> static-analysis-report.md
+          cat js-analysis.txt >> static-analysis-report.md
+
+      - name: Upload static analysis report
+        uses: actions/upload-artifact@v3
+        with:
+          name: static-analysis-report
+          path: static-analysis-report.md
+
+  automated-testing:
+    name: Automated Accessibility Testing
+    needs: prepare
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Run Pa11y tests
+        run: |
+          echo "{
+            \"urls\": [\"${{ needs.prepare.outputs.urls }}\"],
+            \"standard\": \"WCAG2${{ github.event.inputs.test_level || 'AA' }}\",
+            \"reporters\": [\"cli\", \"json\"]
+          }" > .pa11yci
+          
+          pa11y-ci --json > pa11y-results.json
+
+      - name: Run Axe tests
+        run: |
+          node -e "
+            const puppeteer = require('puppeteer');
+            const { AxePuppeteer } = require('@axe-core/puppeteer');
+            
+            (async () => {
+              const browser = await puppeteer.launch();
+              const results = [];
+              
+              for (const url of '${{ needs.prepare.outputs.urls }}'.split(',')) {
+                const page = await browser.newPage();
+                await page.goto(url);
+                const results = await new AxePuppeteer(page).analyze();
+                results.push({ url, ...results });
+              }
+              
+              console.log(JSON.stringify(results, null, 2));
+              await browser.close();
+            })();" > axe-results.json
+
+      - name: Generate automated testing report
+        run: |
+          echo "# Automated Accessibility Testing Report" > automated-testing-report.md
+          echo "## Test ID: ${{ needs.prepare.outputs.test_id }}" >> automated-testing-report.md
+          
+          echo "## Pa11y Results" >> automated-testing-report.md
+          jq -r '.[] | "### \(.pageUrl)\n\(.issues[] | "- [\(.type)] \(.message)")' pa11y-results.json >> automated-testing-report.md
+          
+          echo "## Axe Results" >> automated-testing-report.md
+          jq -r '.[] | "### \(.url)\n\(.violations[] | "- [\(.impact)] \(.help): \(.description)")' axe-results.json >> automated-testing-report.md
+
+      - name: Upload automated testing report
+        uses: actions/upload-artifact@v3
+        with:
+          name: automated-testing-report
+          path: automated-testing-report.md
+
+  visual-regression:
+    name: Visual Regression Testing
+    needs: prepare
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Install dependencies
+        run: npm install -g backstopjs
+
+      - name: Configure BackstopJS
+        run: |
+          echo "{
+            \"id\": \"accessibility_regression\",
+            \"viewports\": [
+              {
+                \"name\": \"desktop\",
+                \"width\": 1920,
+                \"height\": 1080
+              },
+              {
+                \"name\": \"tablet\",
+                \"width\": 1024,
+                \"height\": 768
+              },
+              {
+                \"name\": \"mobile\",
+                \"width\": 320,
+                \"height\": 480
+              }
+            ],
+            \"scenarios\": [
+              $(echo '${{ needs.prepare.outputs.urls }}' | jq -R 'split(",") | map({
+                "label": .,
+                "url": .,
+                "hideSelectors": [],
+                "removeSelectors": [],
+                "selectors": ["document"],
+                "readyEvent": null,
+                "delay": 500,
+                "misMatchThreshold": 0.1
+              }) | join(",")')
+            ]
+          }" > backstop.json
+
+      - name: Run visual regression tests
+        run: |
+          backstop reference
+          backstop test
+
+      - name: Generate visual regression report
+        run: |
+          echo "# Visual Regression Testing Report" > visual-regression-report.md
+          echo "## Test ID: ${{ needs.prepare.outputs.test_id }}" >> visual-regression-report.md
+          
+          echo "## Test Results" >> visual-regression-report.md
+          jq -r '.tests[] | "### \(.pair.label)\n- Status: \(.status)\n- Mismatch: \(.mismatch)%"' backstop_data/json_report/jsonReport.json >> visual-regression-report.md
+
+      - name: Upload visual regression report
+        uses: actions/upload-artifact@v3
+        with:
+          name: visual-regression-report
+          path: |
+            visual-regression-report.md
+            backstop_data/
+
+  consolidate:
+    name: Consolidate Reports
+    needs: [prepare, static-analysis, automated-testing, visual-regression]
+    runs-on: ubuntu-latest
+    if: always()
+    
+    steps:
+      - name: Download all reports
+        uses: actions/download-artifact@v3
+
+      - name: Generate consolidated report
+        run: |
+          echo "# Accessibility Testing Report" > consolidated-report.md
+          echo "## Test ID: ${{ needs.prepare.outputs.test_id }}" >> consolidated-report.md
+          echo "## WCAG Level: ${{ github.event.inputs.test_level || 'AA' }}" >> consolidated-report.md
+          
+          echo "## Static Analysis" >> consolidated-report.md
+          cat static-analysis-report/static-analysis-report.md >> consolidated-report.md
+          
+          echo "## Automated Testing" >> consolidated-report.md
+          cat automated-testing-report/automated-testing-report.md >> consolidated-report.md
+          
+          echo "## Visual Regression" >> consolidated-report.md
+          cat visual-regression-report/visual-regression-report.md >> consolidated-report.md
+
+      - name: Upload consolidated report
+        uses: actions/upload-artifact@v3
+        with:
+          name: consolidated-report
+          path: consolidated-report.md
+
+  notify:
+    name: Send Notifications
+    needs: [prepare, consolidate]
+    runs-on: ubuntu-latest
+    if: always()
+    
+    steps:
+      - name: Download consolidated report
+        uses: actions/download-artifact@v3
+        with:
+          name: consolidated-report
+
+      - name: Send Slack notification
+        uses: slackapi/slack-github-action@v1.24.0
+        with:
+          channel-id: 'accessibility'
+          slack-message: |
+            :wheelchair: Accessibility Testing Complete
+            
+            Test ID: ${{ needs.prepare.outputs.test_id }}
+            WCAG Level: ${{ github.event.inputs.test_level || 'AA' }}
+            
+            Status:
+            - Static Analysis: ${{ needs.static-analysis.result }}
+            - Automated Testing: ${{ needs.automated-testing.result }}
+            - Visual Regression: ${{ needs.visual-regression.result }}
+            
+            View detailed report: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+
+      - name: Send email notification
+        if: failure()
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: ${{ secrets.SMTP_SERVER }}
+          server_port: ${{ secrets.SMTP_PORT }}
+          username: ${{ secrets.SMTP_USERNAME }}
+          password: ${{ secrets.SMTP_PASSWORD }}
+          subject: "Accessibility Testing Failed"
+          body: |
+            Accessibility testing has failed.
+            
+            Test ID: ${{ needs.prepare.outputs.test_id }}
+            WCAG Level: ${{ github.event.inputs.test_level || 'AA' }}
+            
+            Check the detailed report: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          to: accessibility@aweacademy.com
+          from: AWE Academy Accessibility <accessibility@aweacademy.com>
