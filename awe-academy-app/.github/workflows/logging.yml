@@ -1,0 +1,340 @@
+name: Logging Management
+
+on:
+  schedule:
+    - cron: '0 * * * *'  # Run hourly
+  workflow_dispatch:
+    inputs:
+      log_type:
+        description: 'Type of logs to process'
+        required: true
+        type: choice
+        options:
+          - all
+          - application
+          - system
+          - security
+          - access
+      time_range:
+        description: 'Time range to process'
+        required: true
+        default: '1h'
+        type: choice
+        options:
+          - 1h
+          - 6h
+          - 12h
+          - 24h
+      log_level:
+        description: 'Minimum log level'
+        required: true
+        default: 'error'
+        type: choice
+        options:
+          - debug
+          - info
+          - warn
+          - error
+          - critical
+
+jobs:
+  prepare:
+    name: Prepare Log Processing
+    runs-on: ubuntu-latest
+    
+    outputs:
+      process_id: ${{ steps.generate.outputs.id }}
+      start_time: ${{ steps.timerange.outputs.start }}
+      end_time: ${{ steps.timerange.outputs.end }}
+    
+    steps:
+      - name: Generate process ID
+        id: generate
+        run: echo "id=$(date +%Y%m%d_%H%M%S)_$RANDOM" >> $GITHUB_OUTPUT
+
+      - name: Calculate time range
+        id: timerange
+        run: |
+          end_time=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          
+          case "${{ github.event.inputs.time_range || '1h' }}" in
+            "1h")
+              start_time=$(date -u -d "1 hour ago" +"%Y-%m-%dT%H:%M:%SZ")
+              ;;
+            "6h")
+              start_time=$(date -u -d "6 hours ago" +"%Y-%m-%dT%H:%M:%SZ")
+              ;;
+            "12h")
+              start_time=$(date -u -d "12 hours ago" +"%Y-%m-%dT%H:%M:%SZ")
+              ;;
+            "24h")
+              start_time=$(date -u -d "24 hours ago" +"%Y-%m-%dT%H:%M:%SZ")
+              ;;
+          esac
+          
+          echo "start=$start_time" >> $GITHUB_OUTPUT
+          echo "end=$end_time" >> $GITHUB_OUTPUT
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+  application:
+    name: Application Log Processing
+    needs: prepare
+    runs-on: ubuntu-latest
+    if: github.event.inputs.log_type == 'all' || github.event.inputs.log_type == 'application'
+    
+    steps:
+      - name: Fetch application logs
+        run: |
+          aws logs filter-log-events \
+            --log-group-name "/aws/aweacademy/application" \
+            --start-time $(date -d "${{ needs.prepare.outputs.start_time }}" +%s%N | cut -b1-13) \
+            --end-time $(date -d "${{ needs.prepare.outputs.end_time }}" +%s%N | cut -b1-13) \
+            --filter-pattern "${{ github.event.inputs.log_level || 'error' }}" \
+            > application-logs.json
+
+      - name: Analyze application logs
+        run: |
+          echo "# Application Log Analysis" > application-report.md
+          echo "## Process ID: ${{ needs.prepare.outputs.process_id }}" >> application-report.md
+          echo "## Time Range: ${{ needs.prepare.outputs.start_time }} to ${{ needs.prepare.outputs.end_time }}" >> application-report.md
+          
+          echo "## Error Distribution" >> application-report.md
+          jq -r '.events[] | .message' application-logs.json | \
+            grep -oP '(?<=\[)[^\]]+(?=\])' | \
+            sort | uniq -c | sort -nr >> application-report.md
+          
+          echo "## Most Affected Routes" >> application-report.md
+          jq -r '.events[] | .message' application-logs.json | \
+            grep -oP 'GET|POST|PUT|DELETE \K[^ ]+' | \
+            sort | uniq -c | sort -nr | head -10 >> application-report.md
+
+      - name: Upload application results
+        uses: actions/upload-artifact@v3
+        with:
+          name: application-logs
+          path: |
+            application-logs.json
+            application-report.md
+
+  system:
+    name: System Log Processing
+    needs: prepare
+    runs-on: ubuntu-latest
+    if: github.event.inputs.log_type == 'all' || github.event.inputs.log_type == 'system'
+    
+    steps:
+      - name: Fetch system logs
+        run: |
+          aws logs filter-log-events \
+            --log-group-name "/aws/aweacademy/system" \
+            --start-time $(date -d "${{ needs.prepare.outputs.start_time }}" +%s%N | cut -b1-13) \
+            --end-time $(date -d "${{ needs.prepare.outputs.end_time }}" +%s%N | cut -b1-13) \
+            --filter-pattern "${{ github.event.inputs.log_level || 'error' }}" \
+            > system-logs.json
+
+      - name: Analyze system logs
+        run: |
+          echo "# System Log Analysis" > system-report.md
+          echo "## Process ID: ${{ needs.prepare.outputs.process_id }}" >> system-report.md
+          echo "## Time Range: ${{ needs.prepare.outputs.start_time }} to ${{ needs.prepare.outputs.end_time }}" >> system-report.md
+          
+          echo "## Resource Usage" >> system-report.md
+          jq -r '.events[] | select(.message | contains("resource")) | .message' system-logs.json | \
+            sort | uniq -c | sort -nr >> system-report.md
+          
+          echo "## Service Status" >> system-report.md
+          jq -r '.events[] | select(.message | contains("service")) | .message' system-logs.json | \
+            sort | uniq -c | sort -nr >> system-report.md
+
+      - name: Upload system results
+        uses: actions/upload-artifact@v3
+        with:
+          name: system-logs
+          path: |
+            system-logs.json
+            system-report.md
+
+  security:
+    name: Security Log Processing
+    needs: prepare
+    runs-on: ubuntu-latest
+    if: github.event.inputs.log_type == 'all' || github.event.inputs.log_type == 'security'
+    
+    steps:
+      - name: Fetch security logs
+        run: |
+          aws logs filter-log-events \
+            --log-group-name "/aws/aweacademy/security" \
+            --start-time $(date -d "${{ needs.prepare.outputs.start_time }}" +%s%N | cut -b1-13) \
+            --end-time $(date -d "${{ needs.prepare.outputs.end_time }}" +%s%N | cut -b1-13) \
+            --filter-pattern "${{ github.event.inputs.log_level || 'error' }}" \
+            > security-logs.json
+
+      - name: Analyze security logs
+        run: |
+          echo "# Security Log Analysis" > security-report.md
+          echo "## Process ID: ${{ needs.prepare.outputs.process_id }}" >> security-report.md
+          echo "## Time Range: ${{ needs.prepare.outputs.start_time }} to ${{ needs.prepare.outputs.end_time }}" >> security-report.md
+          
+          echo "## Authentication Events" >> security-report.md
+          jq -r '.events[] | select(.message | contains("auth")) | .message' security-logs.json | \
+            sort | uniq -c | sort -nr >> security-report.md
+          
+          echo "## Suspicious Activities" >> security-report.md
+          jq -r '.events[] | select(.message | contains("suspicious")) | .message' security-logs.json | \
+            sort | uniq -c | sort -nr >> security-report.md
+
+      - name: Upload security results
+        uses: actions/upload-artifact@v3
+        with:
+          name: security-logs
+          path: |
+            security-logs.json
+            security-report.md
+
+  access:
+    name: Access Log Processing
+    needs: prepare
+    runs-on: ubuntu-latest
+    if: github.event.inputs.log_type == 'all' || github.event.inputs.log_type == 'access'
+    
+    steps:
+      - name: Fetch access logs
+        run: |
+          aws logs filter-log-events \
+            --log-group-name "/aws/aweacademy/access" \
+            --start-time $(date -d "${{ needs.prepare.outputs.start_time }}" +%s%N | cut -b1-13) \
+            --end-time $(date -d "${{ needs.prepare.outputs.end_time }}" +%s%N | cut -b1-13) \
+            > access-logs.json
+
+      - name: Analyze access logs
+        run: |
+          echo "# Access Log Analysis" > access-report.md
+          echo "## Process ID: ${{ needs.prepare.outputs.process_id }}" >> access-report.md
+          echo "## Time Range: ${{ needs.prepare.outputs.start_time }} to ${{ needs.prepare.outputs.end_time }}" >> access-report.md
+          
+          echo "## Top IP Addresses" >> access-report.md
+          jq -r '.events[] | .message' access-logs.json | \
+            grep -oP '\d+\.\d+\.\d+\.\d+' | \
+            sort | uniq -c | sort -nr | head -10 >> access-report.md
+          
+          echo "## Top User Agents" >> access-report.md
+          jq -r '.events[] | .message' access-logs.json | \
+            grep -oP '"[^"]*"$' | \
+            sort | uniq -c | sort -nr | head -10 >> access-report.md
+
+      - name: Upload access results
+        uses: actions/upload-artifact@v3
+        with:
+          name: access-logs
+          path: |
+            access-logs.json
+            access-report.md
+
+  archive:
+    name: Archive Logs
+    needs: [prepare, application, system, security, access]
+    runs-on: ubuntu-latest
+    if: always()
+    
+    steps:
+      - name: Download all logs
+        uses: actions/download-artifact@v3
+
+      - name: Prepare archive
+        run: |
+          mkdir -p logs/${{ needs.prepare.outputs.process_id }}
+          cp -r *-logs/* logs/${{ needs.prepare.outputs.process_id }}/
+          
+          tar -czf logs-${{ needs.prepare.outputs.process_id }}.tar.gz logs/
+
+      - name: Upload to S3
+        run: |
+          aws s3 cp \
+            logs-${{ needs.prepare.outputs.process_id }}.tar.gz \
+            s3://${{ secrets.LOGS_BUCKET }}/archives/
+
+  report:
+    name: Generate Report
+    needs: [prepare, application, system, security, access]
+    runs-on: ubuntu-latest
+    if: always()
+    
+    steps:
+      - name: Download all reports
+        uses: actions/download-artifact@v3
+
+      - name: Generate consolidated report
+        run: |
+          echo "# Log Analysis Report" > consolidated-report.md
+          echo "## Process ID: ${{ needs.prepare.outputs.process_id }}" >> consolidated-report.md
+          echo "## Time Range: ${{ needs.prepare.outputs.start_time }} to ${{ needs.prepare.outputs.end_time }}" >> consolidated-report.md
+          
+          echo "## Application Logs" >> consolidated-report.md
+          cat application-logs/application-report.md >> consolidated-report.md
+          
+          echo "## System Logs" >> consolidated-report.md
+          cat system-logs/system-report.md >> consolidated-report.md
+          
+          echo "## Security Logs" >> consolidated-report.md
+          cat security-logs/security-report.md >> consolidated-report.md
+          
+          echo "## Access Logs" >> consolidated-report.md
+          cat access-logs/access-report.md >> consolidated-report.md
+
+      - name: Upload consolidated report
+        uses: actions/upload-artifact@v3
+        with:
+          name: consolidated-report
+          path: consolidated-report.md
+
+  notify:
+    name: Send Notifications
+    needs: [prepare, report]
+    runs-on: ubuntu-latest
+    if: always()
+    
+    steps:
+      - name: Download consolidated report
+        uses: actions/download-artifact@v3
+        with:
+          name: consolidated-report
+
+      - name: Send Slack notification
+        uses: slackapi/slack-github-action@v1.24.0
+        with:
+          channel-id: 'logging'
+          slack-message: |
+            :page_with_curl: Log Processing Complete
+            
+            Process ID: ${{ needs.prepare.outputs.process_id }}
+            Time Range: ${{ needs.prepare.outputs.start_time }} to ${{ needs.prepare.outputs.end_time }}
+            
+            Status:
+            - Application: ${{ needs.application.result }}
+            - System: ${{ needs.system.result }}
+            - Security: ${{ needs.security.result }}
+            - Access: ${{ needs.access.result }}
+            
+            View detailed report: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+
+      - name: Send email notification
+        if: failure() || contains(github.event.inputs.log_level, 'critical')
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: ${{ secrets.SMTP_SERVER }}
+          server_port: ${{ secrets.SMTP_PORT }}
+          username: ${{ secrets.SMTP_USERNAME }}
+          password: ${{ secrets.SMTP_PASSWORD }}
+          subject: "Log Analysis Report"
+          body: file://consolidated-report.md
+          to: ops@aweacademy.com
+          from: AWE Academy Logging <logging@aweacademy.com>
